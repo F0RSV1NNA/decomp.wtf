@@ -170,6 +170,14 @@ def build_project(exe: Path, dest: Path, *, slug: str | None = None, names: dict
     slug = slug or f"{re.sub(r'[^a-zA-Z0-9]+', '-', exe.stem).strip('-').lower()}-pe64"
     drafts = drafts or {}
 
+    # An application project (pe/appproject.py) can hold several modules; regenerating the
+    # tree would destroy every one of them. Refuse instead of doing it.
+    if (dest / ".decomp.wtf.json").exists():
+        existing = json.loads((dest / ".decomp.wtf.json").read_text(encoding="utf-8"))
+        if existing.get("kind") == "pe64-application" or existing.get("modules"):
+            raise ValueError(
+                f"{dest} is an application project: use pe.appproject.add_module() to add a "
+                f"module, or a new destination. build_project would delete every module in it.")
     if dest.exists():
         shutil.rmtree(dest)
     for sub in ("target", "build", "src", "asm", "include", "notes"):
