@@ -1,0 +1,216 @@
+{
+ "od": {
+  "exe": "test_od.exe",
+  "exe_bytes": 4096,
+  "code_rva": 4096,
+  "text_vsize": 1136,
+  "functions": [
+   {
+    "name": "add_mul",
+    "rva": 4096,
+    "size_upper_bound": 32
+   },
+   {
+    "name": "shifts",
+    "rva": 4128,
+    "size_upper_bound": 32
+   },
+   {
+    "name": "mixed_math",
+    "rva": 4160,
+    "size_upper_bound": 80
+   },
+   {
+    "name": "classify",
+    "rva": 4240,
+    "size_upper_bound": 64
+   },
+   {
+    "name": "clamp",
+    "rva": 4304,
+    "size_upper_bound": 64
+   },
+   {
+    "name": "stacky",
+    "rva": 4368,
+    "size_upper_bound": 96
+   },
+   {
+    "name": "deep",
+    "rva": 4464,
+    "size_upper_bound": 64
+   },
+   {
+    "name": "sw",
+    "rva": 4528,
+    "size_upper_bound": 160
+   },
+   {
+    "name": "my_strlen",
+    "rva": 4688,
+    "size_upper_bound": 64
+   },
+   {
+    "name": "use_string",
+    "rva": 4752,
+    "size_upper_bound": 32
+   },
+   {
+    "name": "bump",
+    "rva": 4784,
+    "size_upper_bound": 64
+   },
+   {
+    "name": "read_globals",
+    "rva": 4848,
+    "size_upper_bound": 64
+   },
+   {
+    "name": "caller",
+    "rva": 4912,
+    "size_upper_bound": 64
+   },
+   {
+    "name": "pipeline",
+    "rva": 4976,
+    "size_upper_bound": 112
+   },
+   {
+    "name": "main",
+    "rva": 5088,
+    "size_upper_bound": 144
+   }
+  ],
+  "labels": [
+   "$LN14"
+  ],
+  "pdata": [
+   {
+    "begin": 4160,
+    "end": 4220,
+    "unwind": 8404
+   },
+   {
+    "begin": 4368,
+    "end": 4457,
+    "unwind": 8412
+   },
+   {
+    "begin": 4464,
+    "end": 4521,
+    "unwind": 8420
+   },
+   {
+    "begin": 4528,
+    "end": 4672,
+    "unwind": 8428
+   },
+   {
+    "begin": 4688,
+    "end": 4739,
+    "unwind": 8436
+   },
+   {
+    "begin": 4752,
+    "end": 4773,
+    "unwind": 8444
+   },
+   {
+    "begin": 4912,
+    "end": 4962,
+    "unwind": 8452
+   },
+   {
+    "begin": 4976,
+    "end": 5084,
+    "unwind": 8460
+   },
+   {
+    "begin": 5088,
+    "end": 5232,
+    "unwind": 8468
+   }
+  ],
+  "multi_record": [],
+  "no_record": [
+   "add_mul",
+   "bump",
+   "clamp",
+   "classify",
+   "read_globals",
+   "shifts"
+  ]
+ },
+ "o2": {
+  "exe": "test_o2.exe",
+  "exe_bytes": 3072,
+  "code_rva": 4096,
+  "text_vsize": 490,
+  "functions": [
+   {
+    "name": "caller",
+    "rva": 4096,
+    "size_upper_bound": 80
+   },
+   {
+    "name": "deep",
+    "rva": 4176,
+    "size_upper_bound": 16
+   },
+   {
+    "name": "pipeline",
+    "rva": 4192,
+    "size_upper_bound": 240
+   },
+   {
+    "name": "read_globals",
+    "rva": 4432,
+    "size_upper_bound": 32
+   },
+   {
+    "name": "use_string",
+    "rva": 4464,
+    "size_upper_bound": 32
+   },
+   {
+    "name": "main",
+    "rva": 4496,
+    "size_upper_bound": 90
+   }
+  ],
+  "labels": [
+   "$LN31"
+  ],
+  "pdata": [
+   {
+    "begin": 4192,
+    "end": 4283,
+    "unwind": 8404
+   },
+   {
+    "begin": 4283,
+    "end": 4313,
+    "unwind": 8412
+   },
+   {
+    "begin": 4313,
+    "end": 4428,
+    "unwind": 8432
+   },
+   {
+    "begin": 4496,
+    "end": 4586,
+    "unwind": 8448
+   }
+  ],
+  "multi_record": [
+   "pipeline"
+  ],
+  "no_record": [
+   "caller",
+   "deep",
+   "read_globals",
+   "use_string"
+  ]
+ }
+}
