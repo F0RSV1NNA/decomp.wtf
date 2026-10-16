@@ -148,6 +148,34 @@ def uv() -> str | None:
     return None
 
 
+FORK_MARKER = "FORK-DEPLOY.json"
+
+
+def fork_deploy() -> dict | None:
+    """The record tools/deploy.py leaves behind when this install is the fork.
+
+    Updating installs upstream's package with `uv tool install --force`, which would replace
+    every local change -- the PE64 importer, the module model, the jump-table reconstruction --
+    and leave no trace of why they went. So the marker makes it refusable rather than silent.
+    """
+    try:
+        path = Path(__file__).resolve().parents[2] / FORK_MARKER
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+    except (OSError, ValueError):
+        return None
+
+
+def refuse_if_forked() -> None:
+    info = fork_deploy()
+    if not info:
+        return
+    raise RuntimeError(
+        f"this install is a local fork of decomp.wtf ({str(info.get('commit', '?'))[:12]} from "
+        f"{info.get('fork', '?')}), and updating would replace it with upstream's package, losing "
+        f"the PE64 importer and the module model. Update the fork and run tools/deploy.py instead. "
+        f"To accept the loss, delete {FORK_MARKER} beside the decompnet package and update again.")
+
+
 def can_apply() -> tuple[bool, str]:
     if sys.platform == "win32":
         return False, ("decomp.wtf now runs in WSL 2 on Windows: run the installer again in PowerShell "
@@ -159,6 +187,7 @@ def can_apply() -> tuple[bool, str]:
 
 def install(found: dict, log=print) -> dict:
     """Install the version check() found. Returns the new install info (not yet the running version)."""
+    refuse_if_forked()
     ok, why = can_apply()
     if not ok:
         raise RuntimeError(why)
