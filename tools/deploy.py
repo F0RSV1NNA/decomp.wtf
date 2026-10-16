@@ -128,12 +128,34 @@ def verify_backup(dest: Path) -> dict:
 
 # --- tests ----------------------------------------------------------------------------------
 
+def test_python(explicit: str = "") -> str:
+    """An interpreter that can actually run the suite.
+
+    The tool's own venv has no pytest -- it ships only what the app needs -- so `-m pytest`
+    there exits with "No module named pytest", produces no FAILED lines, and a naive gate
+    reads that as success. Look for one that genuinely has it, and refuse if there is none.
+    """
+    candidates = [explicit] if explicit else []
+    candidates += [str(REPO.parent / "venv/bin/python"), str(Path.home() / ".local/share/uv/tools/decompnet/bin/python")]
+    for cand in candidates:
+        if cand and Path(cand).exists():
+            probe = run([cand, "-c", "import pytest"], env=dict(os.environ, PYTHONPATH=str(REPO / "src")))
+            if probe.returncode == 0:
+                return cand
+    raise SystemExit("  no interpreter with pytest found: refusing to deploy untested.\n"
+                     "  Pass --test-python /path/to/python (the dev venv has it).")
+
+
 def test_failures(python: str) -> set[str]:
     env = dict(os.environ, PYTHONPATH=str(REPO / "src"))
     res = subprocess.run([python, "-m", "pytest", "tests", "-q", "--tb=no", "-p", "no:cacheprovider"],
                          cwd=REPO, env=env, capture_output=True, text=True, timeout=3600)
-    tail = (res.stdout + res.stderr).strip().splitlines()
+    out = res.stdout + res.stderr
+    tail = out.strip().splitlines()
     log("    " + (tail[-1] if tail else "no output"))
+    if res.returncode not in (0, 1):
+        raise SystemExit(f"  the test run did not complete (exit {res.returncode}):\n"
+                         + "\n".join("    " + l for l in tail[-8:]))
     return {l.split(" - ")[0].strip() for l in res.stdout.splitlines()
             if l.startswith(("FAILED", "ERROR"))}
 
@@ -211,20 +233,32 @@ def mcp_tools(name: str = "deploy-check") -> list[str]:
         json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n",
         json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n",
     ])
+    # step by step: the bridge needs the handshake to settle before tools/list means anything
     proc = subprocess.Popen([str(bridge), "mcp", "--name", name], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    deadline = time.time() + 60
     try:
-        out, _ = proc.communicate(script, timeout=60)
-    except subprocess.TimeoutExpired:
+        for msg, pause in ((json.loads(script.splitlines()[0]), 3.0),
+                           (json.loads(script.splitlines()[1]), 3.0),
+                           (json.loads(script.splitlines()[2]), 0.0)):
+            proc.stdin.write(json.dumps(msg) + "\n")
+            proc.stdin.flush()
+            if pause:
+                time.sleep(pause)
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            try:
+                got = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(got.get("result"), dict) and "tools" in got["result"]:
+                return [t["name"] for t in got["result"]["tools"]]
+    except (OSError, ValueError):
+        pass
+    finally:
         proc.kill()
-        return []
-    for line in out.splitlines():
-        try:
-            msg = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(msg.get("result"), dict) and "tools" in msg["result"]:
-            return [t["name"] for t in msg["result"]["tools"]]
     return []
 
 
@@ -283,7 +317,7 @@ def deploy(args) -> int:
 
     if not args.skip_tests:
         log("2. tests")
-        run_tests(str(tool / "bin/python"), force=args.force)
+        run_tests(test_python(args.test_python), force=args.force)
     else:
         log("2. tests SKIPPED (--skip-tests)")
 
@@ -347,6 +381,8 @@ def main() -> int:
     ap.add_argument("--skip-tests", action="store_true")
     ap.add_argument("--force", action="store_true", help="deploy despite new test failures")
     ap.add_argument("--allow-dirty", action="store_true")
+    ap.add_argument("--test-python", default="",
+                    help="interpreter to run the suite with (must have pytest)")
     ap.add_argument("--rollback", default="")
     return rollback(ap.parse_args()) if "--rollback" in sys.argv else deploy(ap.parse_args())
 
