@@ -17,15 +17,23 @@ displacement becomes the table's RVA and each entry becomes the RVA of its case 
 The load is *not* RIP-relative -- it is indexed off a register -- so nothing in `coff.py`
 can see it.
 
-Recovering it needs three things:
-  * recognise the register holding the image base, so the `mov` reads as an indexed load
-    off it rather than an ordinary load with a large displacement;
-  * put the ADDR32NB relocation back on the displacement and zero the field;
-  * carry the referenced bytes into a second section, with a relocation per entry.
+Three things had to be right, and each was measured against the MSVC object rather than
+assumed. With only the first, `sw` sat at 60.85%; with all three it is 100.00%:
 
-Not every indexed load off the image base is a table, so the two are kept apart: if the
-bytes at the target are not a run of plausible code addresses it is left alone and reported
-in `notes` as ambiguous, rather than guessed at.
+  1. **Where the table lives.** It stays in **.text**, not in a .rdata the object does not
+     even have: ref.obj's sections are .drectve/.debug$S/.bss/.data/.text$mn/.xdata/.pdata/
+     .chks64, and the bytes at `.text$mn + 0x220` are all zero. Moving the table into a new
+     .rdata section was tried and made the score worse (16.7%), which is the measurement
+     that pointed here.
+  2. **Its representation.** Entries are zeroed with one ADDR32NB relocation each, at
+     +0x70, +0x74 ... +0x8c in the object -- which is what this module reconstructs.
+  3. **The function's extent.** The symbol runs to the *next* symbol, not to the end of
+     .pdata's unwind region: 160 bytes, code (112) + table (32) + 16 bytes of `0xcc` padding.
+     .pdata stops at 144, so a function made only of what .pdata describes is 16 bytes short
+     and still does not compare (58.97% without the padding, 100.00% with it).
+
+Not every indexed load off the image base is a table, so a target whose bytes are not a run
+of plausible code addresses is left alone and reported in `notes` instead of guessed at.
 """
 
 from __future__ import annotations
@@ -35,30 +43,29 @@ from dataclasses import dataclass, field
 
 import capstone
 
-from .coff import (IMAGE_REL_AMD64_ADDR32NB, IMAGE_SYM_CLASS_EXTERNAL,
-                   IMAGE_SYM_DTYPE_FUNCTION, Reloc, _md, _mask, _name)
+from .coff import (IMAGE_REL_AMD64_ADDR32NB, IMAGE_SYM_CLASS_EXTERNAL, Reloc, _md,
+                   build_object, reconstruct_relocations)
 from .image import PEImage
 
-IMAGE_SYM_CLASS_STATIC = 3
-IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040
-IMAGE_SCN_MEM_READ = 0x40000000
-IMAGE_SCN_ALIGN_16BYTES = 0x00500000
-RDATA_CHARACTERISTICS = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_ALIGN_16BYTES
-
-MAX_TABLE_ENTRIES = 4096   # a switch longer than this is not believed
+MAX_TABLE_ENTRIES = 4096      # a switch longer than this is not believed
+PADDING_BYTE = 0xCC           # what MSVC pads the gap between functions with
 
 
 @dataclass
-class Blob:
-    """Bytes recovered from the image that a function refers to, to be re-emitted."""
+class Table:
+    """A jump table recovered from the image.
 
-    name: str
+    `offset` is where it starts inside the function, which is where its entries have to be
+    zeroed and relocated: the table does not move sections, it stays put in .text.
+    """
+
     rva: int
-    data: bytes
-    relocs: list[Reloc] = field(default_factory=list)   # offsets are within `data`
+    offset: int
+    entries: list[int]
 
-    def __len__(self) -> int:
-        return len(self.data)
+    @property
+    def size(self) -> int:
+        return 4 * len(self.entries)
 
 
 @dataclass
@@ -66,7 +73,7 @@ class Recovered:
     """What a function refers to, and anything ambiguous that was left alone."""
 
     code_relocs: list[Reloc] = field(default_factory=list)
-    blobs: list[Blob] = field(default_factory=list)
+    tables: list[Table] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 
@@ -98,14 +105,13 @@ def read_table(img: PEImage, rva: int) -> list[int]:
 
 def find_referenced_data(code: bytes, base_rva: int, img: PEImage, *,
                          size: int | None = None) -> Recovered:
-    """Every switch table a function indexes, and the bytes of each.
+    """Every switch table a function indexes, and the data each entry points at.
 
     Only the shape MSVC actually emits is understood, and only when it is unambiguous.
     """
-    end = base_rva + (size if size is not None else len(code))
     out = Recovered()
     image_base_regs: set[int] = set()
-    seen: dict[int, Blob] = {}
+    seen: set[int] = set()
 
     md = _md()
     for ins in md.disasm(code, base_rva):
@@ -143,123 +149,43 @@ def find_referenced_data(code: bytes, base_rva: int, img: PEImage, *,
             entries = read_table(img, table_rva)
             if not entries:
                 out.notes.append(f"+{off:#x}: indexes off the image base at rva {table_rva:#x}, "
-                                 f"but the bytes there are not a run of code addresses: not treated "
-                                 f"as a table")
+                                 f"but the bytes there are not a run of code addresses: not "
+                                 f"treated as a table")
                 continue
             out.code_relocs.append(Reloc(off + field, IMAGE_REL_AMD64_ADDR32NB, table_rva))
             if table_rva not in seen:
-                # the object's entries are zeroed with a relocation each; recover that shape
-                blob = Blob(name=f"table_{table_rva:X}", rva=table_rva,
-                            data=b"\0" * (4 * len(entries)),
-                            relocs=[Reloc(4 * i, IMAGE_REL_AMD64_ADDR32NB, v)
-                                    for i, v in enumerate(entries)])
-                seen[table_rva] = blob
-                out.blobs.append(blob)
+                seen.add(table_rva)
+                out.tables.append(Table(rva=table_rva, offset=table_rva - base_rva, entries=entries))
 
-    del end  # size is only used to bound the scan above
     out.code_relocs.sort(key=lambda r: r.offset)
-    out.blobs.sort(key=lambda b: b.rva)
+    out.tables.sort(key=lambda t: t.offset)
     return out
 
 
-def build_with_data(function_name: str, code: bytes, relocs: list[Reloc], blobs: list[Blob], *,
-                    target_name=lambda rva: f"sub_{rva:X}") -> bytes:
-    """A COFF object with the function in .text and the data it refers to in .rdata.
+def table_aware_object(img: PEImage, rva: int, size: int, name: str, *,
+                       next_rva: int | None = None):
+    """(object, relocations, tables, notes) for one function, jump tables included.
 
-    Symbols: the function, then one defined symbol per blob, then one undefined symbol per
-    address neither of those defines. Relocations to a blob point at the blob symbol, which
-    is what a compiler emits for a table it defines itself.
+    `size` is the region the image attributes to the function. That is what .pdata gives,
+    and it is not the same as the symbol's extent: .pdata stops at the end of the code plus
+    any table, while the object's symbol runs to the next symbol. `next_rva` supplies the
+    next function's address so the .text can be padded out to the same extent, which is what
+    makes the last of the three corrections above -- 16 bytes of 0xcc -- let it match.
     """
-    code = bytes(_mask(bytearray(code), relocs))
-
-    strings = bytearray()
-
-    def name_field(nm: str) -> bytes:
-        f, extra = _name(nm)
-        if f is not None:
-            return f
-        o = len(strings) + 4
-        strings.extend(extra)
-        return b"\0\0\0\0" + struct.pack("<I", o)
-
-    # .rdata contents, and where each blob sits in it
-    rdata = bytearray()
-    blob_offset: dict[int, int] = {}
-    for b in blobs:
-        blob_offset[b.rva] = len(rdata)
-        rdata.extend(b.data)
-
-    syms: list[tuple[bytes, int, int, int, int]] = []      # name, value, section, type, storage
-    syms.append((name_field(function_name), 0, 1, IMAGE_SYM_DTYPE_FUNCTION, IMAGE_SYM_CLASS_EXTERNAL))
-    blob_sym: dict[int, int] = {}
-    for b in blobs:
-        blob_sym[b.rva] = len(syms)
-        syms.append((name_field(b.name), blob_offset[b.rva], 2, 0, IMAGE_SYM_CLASS_EXTERNAL))
-
-    undef: dict[int, int] = {}
-
-    def sym_for(rva: int) -> int:
-        """The blob symbol if we define that address, else an undefined one."""
-        if rva in blob_sym:
-            return blob_sym[rva]
-        if rva not in undef:
-            undef[rva] = len(syms)
-            syms.append((name_field(target_name(rva)), 0, 0, 0, IMAGE_SYM_CLASS_EXTERNAL))
-        return undef[rva]
-
-    text_records = b"".join(struct.pack("<IIH", r.offset, sym_for(r.target_rva), r.type)
-                            for r in relocs)
-    rdata_records = bytearray()
-    for b in blobs:
-        base = blob_offset[b.rva]
-        for r in b.relocs:
-            rdata_records.extend(
-                struct.pack("<IIH", base + r.offset, sym_for(r.target_rva), r.type))
-
-    n_sections = 2 if blobs else 1
-    raw_off = 20 + 40 * n_sections
-    text_off = raw_off
-    rdata_off = text_off + len(code)
-    text_rel_off = rdata_off + len(rdata)
-    rdata_rel_off = text_rel_off + len(text_records)
-    sym_off = rdata_rel_off + len(rdata_records)
-
-    out = [struct.pack("<HHIIIHH", 0x8664, n_sections, 0, sym_off, len(syms), 0, 0)]
-    out.append(b".text\0\0\0" + struct.pack("<IIIIIIHHI", 0, 0, len(code), text_off,
-                                            text_rel_off if relocs else 0, 0, len(relocs), 0,
-                                            0x60500020))
-    if blobs:
-        out.append(b".rdata\0\0" + struct.pack("<IIIIIIHHI", 0, 0, len(rdata), rdata_off,
-                                               rdata_rel_off if rdata_records else 0, 0,
-                                               len(rdata_records), 0, RDATA_CHARACTERISTICS))
-    out.append(code)
-    out.append(bytes(rdata))
-    out.append(text_records)
-    out.append(bytes(rdata_records))
-    out.append(b"".join(n8 + struct.pack("<IhHBB", v, secn, t, st, 0)
-                        for n8, v, secn, t, st in syms))
-    out.append(struct.pack("<I", 4 + len(strings)) + bytes(strings))
-    return b"".join(out)
-
-
-def function_object_with_data(img: PEImage, rva: int, size: int, name: str) -> tuple[bytes, list[Reloc], list[Blob], list[str]]:
-    """(object, code relocations, data blobs, notes) for one function of an image.
-
-    `size` is the whole region the image attributes to the function, which is what .pdata
-    gives: its EndAddress covers trailing *data* too, not just code.
-
-    Cutting the code back at the table was tried and made things worse (60.8% -> 16.7%), so
-    the code is passed through whole and the table is copied out as well. Leaving the table
-    in .text does not cost a match on its own -- coff.py's 13 functions match with their
-    bytes passed through unchanged -- and what is still not matching here is not yet
-    understood. See the notes in tests/test_pe_tables.py.
-    """
-    from .coff import reconstruct_relocations   # local import: coff does not know about tables
-
     code = img.bytes_at(rva, size) or b""
     relocs = reconstruct_relocations(code, rva, size=size)
     rec = find_referenced_data(code, rva, img, size=size)
-    taken = {r.offset for r in relocs}   # a field is never relocated twice
+
+    taken = {r.offset for r in relocs}      # a field is never relocated twice
     relocs += [r for r in rec.code_relocs if r.offset not in taken]
+    for t in rec.tables:
+        # the entries are relocated in place; build_object zeroes every field a relocation
+        # covers, which is exactly the object's form (the bytes there are all zero)
+        relocs += [Reloc(t.offset + 4 * i, IMAGE_REL_AMD64_ADDR32NB, e)
+                   for i, e in enumerate(t.entries)]
     relocs.sort(key=lambda r: r.offset)
-    return build_with_data(name, code, relocs, rec.blobs), relocs, rec.blobs, rec.notes
+
+    pad_to = (next_rva - rva) if next_rva else 0
+    if pad_to > len(code):
+        code = code + bytes([PADDING_BYTE]) * (pad_to - len(code))
+    return build_object(name, code, relocs), relocs, rec.tables, rec.notes
