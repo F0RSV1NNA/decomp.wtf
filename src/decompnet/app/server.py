@@ -38,6 +38,7 @@ from .engine import COMPILERS, MW_VERSIONS, PLATFORM_STATUS, SHORT_NAMES, TOOLS,
 
 COOKIE = "decomp_live"
 MAX_DISC = 16 * 1024 * 1024 * 1024  # dual-layer DVD and then some
+MAX_PE = 4 << 30                                     # an imported EXE or DLL
 
 
 def file_log(path: Path) -> logging.Logger:
@@ -93,9 +94,15 @@ class Jobs:
         self.log_path = log_path
         self.logger = file_log(log_path) if log_path else logging.getLogger("decomp.wtf")
 
-    def start(self, kind: str, fn) -> str:
+    def start(self, kind: str, fn, *, cancellable: bool = False) -> str:
+        """Run fn in the background.
+
+        `cancellable=True` calls fn(log, should_stop) instead of fn(log), so long work can ask
+        whether it should give up rather than running to the end because nobody told it to stop.
+        """
         jid = uuid.uuid4().hex[:12]
-        job = {"id": jid, "kind": kind, "state": "running", "log": [], "result": None, "error": None, "t": time.time()}
+        job = {"id": jid, "kind": kind, "state": "running", "log": [], "result": None, "error": None,
+               "t": time.time(), "cancel": threading.Event(), "cancellable": cancellable}
         self.jobs[jid] = job
         logger = self.logger
         logger.info("job %s %s started", kind, jid)
@@ -106,7 +113,7 @@ class Jobs:
 
         def run():
             try:
-                job["result"] = fn(log)
+                job["result"] = fn(log, job["cancel"].is_set) if cancellable else fn(log)
                 job["state"] = "done"
                 logger.info("job %s %s done in %.0fs", kind, jid, time.time() - job["t"])
             except BaseException as e:  # noqa: BLE001: a job must end, whatever went wrong
@@ -121,6 +128,26 @@ class Jobs:
                     raise
         threading.Thread(target=run, daemon=True, name=f"job-{kind}").start()
         return jid
+
+    def cancel(self, jid: str) -> dict | None:
+        """Ask a job to stop. It stops between functions, not mid-write, so nothing is left half
+        written; the state goes to cancelling until the worker notices."""
+        job = self.jobs.get(jid)
+        if not job:
+            return None
+        job["cancel"].set()
+        if job["state"] == "running":
+            job["state"] = "cancelling"
+        return job
+
+    def progress(self, jid: str) -> dict:
+        """A compact view of a job: what it is doing, how long, and how far."""
+        job = self.jobs.get(jid) or {}
+        lines = [l for l in job.get("log") or [] if l and l.strip()]
+        return {"id": jid, "kind": job.get("kind"), "state": job.get("state"),
+                "seconds": round(time.time() - job["t"], 1) if job.get("t") else None,
+                "step": lines[-1] if lines else "", "steps": len(lines),
+                "cancellable": bool(job.get("cancellable"))}
 
 
 class Settings:
@@ -490,6 +517,212 @@ def build(net: RomNetwork, home: Path, port: int, secret: str):
         return JSONResponse({"job": jobs.start("import", work)})
 
     MAP_KEYS = ("name", "vram", "size", "insns", "unit", "status", "best", "attempts", "agent", "matched_at", "matched_by")
+
+    # ------------------------------------------------------------ Windows (PE64) projects
+
+    async def receive_pe(request: Request, filename: str) -> Path:
+        """Stream an uploaded EXE or DLL to disk. It is only ever read, never run or loaded."""
+        upload_dir = home / "uploads" / uuid.uuid4().hex[:8]
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        target = upload_dir / Path(filename).name
+        size = 0
+        with open(target, "wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > MAX_PE:
+                    f.close()
+                    shutil.rmtree(upload_dir, ignore_errors=True)
+                    raise ValueError(f"that file is larger than {MAX_PE // (1 << 30)} GB")
+                f.write(chunk)
+        if not size:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            raise ValueError("no file was sent")
+        return target
+
+    def pe_binary(q) -> Path:
+        """The file to import: a path the server can read, or the upload the query names."""
+        if q.get("path"):
+            found = hostenv.local_path(q["path"])
+            if not found.is_file():
+                raise ValueError(f"no file at {found}")
+            return found
+        raise ValueError("no file was sent and no path was given")
+
+    @mcp.custom_route("/api/pe/import", methods=["POST"])
+    async def api_pe_import(request: Request) -> Response:
+        """A Windows EXE or DLL becomes a new application project."""
+        if (bad := guard(request, write=True)):
+            return bad
+        q = request.query_params
+        try:
+            if q.get("path"):
+                binary = pe_binary(q)
+            else:
+                binary = await receive_pe(request, q.get("name") or "module.exe")
+        except ValueError as e:
+            return fail(e)
+
+        name = q.get("name") or binary.stem
+        drafts = q.get("drafts") != "0"
+
+        def work(log):
+            from ..pe import service as pe
+            log(f"importing {binary.name} as {name!r}")
+            # `home` here is DECOMP_HOME/.decomp (build() is handed the internal
+            # directory): uploads belong in it, a project does not.
+            return pe.create(name, binary, home.parent, net, drafts=drafts, log=log)
+        return JSONResponse({"job": jobs.start("import-pe", work)})
+
+    @mcp.custom_route("/api/pe/module", methods=["POST"])
+    async def api_pe_module(request: Request) -> Response:
+        """Another EXE or DLL, added to a project that is already open."""
+        if (bad := guard(request, write=True)):
+            return bad
+        q = request.query_params
+        slug = q.get("slug") or ""
+        if not slug:
+            return fail(ValueError("no project given"))
+        try:
+            if q.get("path"):
+                binary = pe_binary(q)
+            else:
+                binary = await receive_pe(request, q.get("name") or "module.dll")
+        except ValueError as e:
+            return fail(e)
+        drafts = q.get("drafts") != "0"
+
+        def work(log, should_stop):
+            from ..pe import service as pe
+            return pe.add_module(net, slug, binary, home.parent, drafts=drafts, log=log,
+                                 should_stop=should_stop)
+        return JSONResponse({"job": jobs.start("import-pe-module", work, cancellable=True)})
+
+    @mcp.custom_route("/api/pe/modules", methods=["GET"])
+    async def api_pe_modules(request: Request) -> Response:
+        """What the project is made of: modules, and each module's functions."""
+        if (bad := guard(request)):
+            return bad
+        from ..pe import service as pe
+        slug = request.query_params.get("slug", "")
+        try:
+            row = net.project_row(slug)
+        except NetworkError as e:
+            return fail(e)
+        dest = Path(row["root"])
+        if not pe.is_application(dest):
+            return JSONResponse({"application": False, "modules": []})
+        which = request.query_params.get("module", "")
+        out = {"application": True, "slug": slug, "modules": pe.modules(dest),
+               "counts": json.loads(row["config"]).get("counts", {})}
+        if which:
+            try:
+                page = pe.module_functions(
+                    dest, which,
+                    offset=int(request.query_params.get("offset") or 0),
+                    limit=int(request.query_params.get("limit") or 0))
+            except ValueError as e:
+                return fail(e)
+            # the page, not the inventory: a 30,000-function module is megabytes of JSON the
+            # browser would then have to build a row for
+            out["page"] = page
+            out["functions"] = page["functions"]
+        return JSONResponse(out)
+
+    @mcp.custom_route("/api/pause", methods=["GET", "POST"])
+    async def api_pause(request: Request) -> Response:
+        """Pause or resume one project: API agents, autopilot and the Permuter.
+
+        GET reports the state (running / paused / stopped). POST {"slug","paused"} changes it.
+        Resuming clears the flag and nothing else -- it does not start agents, because a pause
+        that resumed by launching eight paid sessions would be a trap.
+        """
+        if (bad := guard(request, write=request.method == "POST")):
+            return bad
+        from . import pause as pause_mod
+
+        if request.method == "GET":
+            slug = request.query_params.get("slug", "")
+            return JSONResponse(pause_mod.state(net, slug)) if slug else fail(ValueError("no project given"))
+        data = await body(request)
+        slug = str(data.get("slug") or "")
+        if not slug:
+            return fail(ValueError("no project given"))
+        try:
+            pause_mod.set_paused(net, slug, bool(data.get("paused")), log=lambda *_: None)
+        except ValueError as e:
+            return fail(e)
+        return JSONResponse(pause_mod.state(net, slug))
+
+    @mcp.custom_route("/api/pe/status", methods=["GET"])
+    async def api_pe_status(request: Request) -> Response:
+        """Honest per-function status for an application project.
+
+        Runs the build to collect the compiler's errors, so it is not on the path that renders
+        a page: a large project would make every page view wait for ninja.
+        """
+        if (bad := guard(request)):
+            return bad
+        from ..pe import service as pe
+        slug = request.query_params.get("slug", "")
+        if not slug:
+            return fail(ValueError("no project given"))
+        try:
+            return JSONResponse(await call(lambda: pe.import_status(net, slug)))
+        except (NetworkError, ValueError, OSError) as e:
+            return fail(e)
+
+    @mcp.custom_route("/api/job/cancel", methods=["POST"])
+    async def api_job_cancel(request: Request) -> Response:
+        """Stop a running job. It stops between functions, so it leaves nothing half written."""
+        if (bad := guard(request, write=True)):
+            return bad
+        jid = str((await body(request)).get("id") or "")
+        job = jobs.cancel(jid)
+        return JSONResponse(jobs.progress(jid)) if job else fail(ValueError("no such job"), 404)
+
+    @mcp.custom_route("/api/job/progress", methods=["GET"])
+    async def api_job_progress(request: Request) -> Response:
+        if (bad := guard(request)):
+            return bad
+        jid = request.query_params.get("id", "")
+        return JSONResponse(jobs.progress(jid)) if jid in jobs.jobs else fail(ValueError("no such job"), 404)
+
+    @mcp.custom_route("/api/pe/repair", methods=["POST"])
+    async def api_pe_repair(request: Request) -> Response:
+        """Repair drafts that do not compile. Bounded, deterministic, and it leaves a file a
+        person has edited alone."""
+        if (bad := guard(request, write=True)):
+            return bad
+        data = await body(request)
+        slug = str(data.get("slug") or "")
+        if not slug:
+            return fail(ValueError("no project given"))
+        module = str(data.get("module") or "")
+        symbols = [str(s) for s in (data.get("symbols") or [])] or None
+
+        def work(log, should_stop):
+            from ..pe import service as pe
+            return pe.repair_functions(net, slug, module=module, symbols=symbols, log=log)
+        return JSONResponse({"job": jobs.start("pe-repair", work, cancellable=True)})
+
+    @mcp.custom_route("/api/pe/repairs", methods=["GET"])
+    async def api_pe_repairs(request: Request) -> Response:
+        """What has been repaired so far: each change, why, and what was assumed."""
+        if (bad := guard(request)):
+            return bad
+        from ..pe import service as pe
+        slug = request.query_params.get("slug", "")
+        if not slug:
+            return fail(ValueError("no project given"))
+        try:
+            dest = Path(net.project_row(slug)["root"])
+        except NetworkError as e:
+            return fail(e)
+        rows = pe.repair_module_history(dest, request.query_params.get("module", ""))
+        symbol = request.query_params.get("symbol", "")
+        if symbol:
+            rows = [r for r in rows if r["symbol"] == symbol]
+        return JSONResponse({"slug": slug, "count": len(rows), "repairs": rows})
 
     @mcp.custom_route("/api/map", methods=["GET"])
     async def api_map(request: Request) -> Response:

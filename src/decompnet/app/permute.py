@@ -51,6 +51,10 @@ class Permuter:
         return None if st is None else {k: v for k, v in st.__dict__.items() if k != "stop"}
 
     def start(self, slug: str) -> State | None:
+        from . import pause
+
+        if pause.is_paused(self.net, slug):
+            return False
         """Run on the project's near misses until there are none (looking again every few minutes while the
         app runs: agents make new ones)."""
         if (st := self.jobs.get(slug)) is not None and st.state == "running":

@@ -55,6 +55,10 @@ typedef unsigned short undefined2;
 typedef unsigned int undefined4;
 typedef unsigned long long undefined8;
 typedef unsigned char undefined;
+/* `code` is how Ghidra spells an indirect call with an unknown target. It is a function pointer,
+   not an unspellable type: without this every draft that calls through a pointer fails to
+   compile for a reason that has nothing to do with the draft. */
+typedef void code(void);
 typedef signed char sbyte;
 typedef unsigned char byte;
 typedef unsigned short ushort;
@@ -127,14 +131,31 @@ def inventory(img: PEImage, *, names: dict[int, str] | None = None,
     return out
 
 
+_MD = None
+
+
+def _disassembler():
+    """One Capstone instance for the process.
+
+    Building a disassembler per function is what made a 4,243-function import take 413 seconds
+    while the same work measured 5.6 seconds in isolation: constructing it dominates disassembling
+    with it. The instance holds no per-function state, so one is enough.
+    """
+    global _MD
+    if _MD is None:
+        import capstone
+
+        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+        md.detail = True
+        md.skipdata = True      # without this disasm() stops at the first undecodable byte
+        _MD = md
+    return _MD
+
+
 def _asm_listing(img: PEImage, fn: RecoveredFunction) -> str:
     """The original assembly, as a listing to read next to the C."""
-    import capstone
-
     code = img.bytes_at(fn.rva, fn.size) or b""
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    md.detail = True
-    md.skipdata = True
+    md = _disassembler()
     lines = [f"; {fn.name}  rva {fn.rva:#x}  {fn.size} bytes  (recovered by {fn.discovered_by})",
              f"; original bytes of the linked image; the target object is target/{fn.name}.obj",
              "", f"{fn.name}:"]
@@ -146,11 +167,13 @@ def _asm_listing(img: PEImage, fn: RecoveredFunction) -> str:
 def _source_for(fn: RecoveredFunction, draft: str | None) -> str:
     """The C a unit starts from: the Ghidra draft, renamed to our own function name."""
     if draft:
-        text = draft.replace(fn.name, fn.name)          # already ours
-        # Ghidra names it FUN_<address> or entry; use the project's name so objdiff pairs
-        # the built object with the target object by symbol
-        text = re.sub(r"\bFUN_[0-9a-fA-F]{6,}\b", fn.name, text)
-        text = re.sub(r"\bentry\b", fn.name, text) if "entry" in text else text
+        # Only the definition takes our name, so objdiff pairs the built object with the target
+        # object by symbol. Replacing every FUN_ would turn a call to another function into a
+        # recursive self-call, and the compiler then reports an arity error that has nothing to
+        # do with the draft.
+        text = re.sub(r"\bFUN_[0-9a-fA-F]{6,}\b", fn.name, draft, count=1)
+        # the `entry` rewrite was removed: it renamed any identifier of that name, which is not a
+        # safe thing to do to code a decompiler produced
         return f'#include "../include/ghidra_types.h"\n\n{text.strip()}\n'
     return ('#include "../include/ghidra_types.h"\n\n'
             + STUB.format(rva=fn.rva, size=fn.size, name=fn.name))

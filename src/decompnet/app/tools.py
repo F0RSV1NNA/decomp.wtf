@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 from importlib import resources
+from pathlib import Path
 from typing import Callable
 
 import anyio
@@ -172,6 +173,163 @@ def _compile(net: RomNetwork, agent: Agent, slug: str, function: str, source: st
     return net.attempt_many(agent, [net.resolve_function(agent, slug, n) for n in names], source, slug)
 
 
+def _pe_home(net) -> Path:
+    from ..pe import service as pe
+
+    return pe.decomp_home(net)
+
+
+def _pe_create(net, path: str, project_name: str = "") -> str:
+    """Create an application project from one EXE or DLL. Returns the slug."""
+    from ..pe import service as pe
+
+    binary = Path(path)
+    if not binary.is_file():
+        return f"error: no file at {binary} (give a path this computer can read)"
+    result = pe.create(project_name or binary.stem, binary, _pe_home(net), net, log=lambda m: None)
+    return (f"created {result['slug']} from {binary.name} with module(s) "
+            f"{', '.join(result['modules'])}. Open it with open_project(\"{result['slug']}\").")
+
+
+def _pe_module_add(net, path: str, project: str = "", session_slug: str = "") -> str:
+    """Add an EXE or DLL to an existing application project."""
+    from ..pe import service as pe
+
+    slug = project or session_slug
+    if not slug:
+        return "error: give the project to add the module to"
+    binary = Path(path)
+    if not binary.is_file():
+        return f"error: no file at {binary} (give a path this computer can read)"
+    result = pe.add_module(net, slug, binary, _pe_home(net), log=lambda m: None)
+    added = ", ".join(result["added"]) or "(nothing new: that module is already in the project)"
+    return f"{slug} now has {len(result['modules'])} module(s): {', '.join(result['modules'])}. Added {added}."
+
+
+def _pe_modules(net, project: str = "", session_slug: str = "") -> str:
+    """What an application project is made of."""
+    from ..pe import service as pe
+
+    slug = project or session_slug
+    if not slug:
+        return "error: give a project"
+    row = net.project_row(slug)
+    dest = Path(row["root"])
+    if not pe.is_application(dest):
+        return f"{slug} is not a Windows application project (it has no modules)."
+    mods = pe.modules(dest)
+    lines = [f"{slug}: {len(mods)} module(s)"]
+    for m in mods:
+        lines.append(f"  {m['name']}  {m['kind']} {m['arch']}  image base {m['image_base']}  "
+                     f"{m['functions']} functions  sha1 {m['sha1'][:12]}")
+        lines.append(f"    imports: {', '.join(m['imports']) or 'none'}"
+                     + (f" (not supplied: {', '.join(m['unresolved'])})" if m["unresolved"] else ""))
+    lines.append(f"Functions are named <module>_<symbol>; use get_pe_module_functions(\"{slug}\", "
+                 f"\"{mods[0]['name'] if mods else ''}\") to list one module's.")
+    return "\n".join(lines)
+
+
+def _pe_functions(net, module: str, project: str = "", session_slug: str = "", status: str = "") -> str:
+    """One module's functions and where each one actually stands."""
+    from ..pe import service as pe
+
+    slug = project or session_slug
+    if not slug:
+        return "error: give a project"
+    dest = Path(net.project_row(slug)["root"])
+    if not pe.is_application(dest):
+        return f"{slug} is not a Windows application project."
+    rows = [r for r in pe.function_status(dest, net, slug) if r["module"] == module]
+    if not rows:
+        return f"no module {module!r} in {slug}. Modules: " + ", ".join(pe.module_names(dest))
+    if status:
+        rows = [r for r in rows if r["status"] == status]
+    head = pe.status_summary([r for r in pe.function_status(dest, net, slug) if r["module"] == module])
+    lines = [f"{slug}/{module}: {head['functions']} functions — {head['matched']} matched, "
+             f"{head['compiled']} compiled, {head['failed']} draft failed, {head['untried']} untried",
+             f"({head['stand_ins']} object(s) in build/ are stand-ins so objdiff can run; they are "
+             f"not compiled candidates.)"]
+    for r in rows[:60]:
+        note = f"  {r['error']}" if r["error"] else ""
+        lines.append(f"  {r['symbol']:<28} rva {r['rva']:<10} {r['size']:>4}B  {r['status']:<9}"
+                     f" found by {r['discovered_by']}{note}")
+    if len(rows) > 60:
+        lines.append(f"  ... and {len(rows) - 60} more")
+    return "\n".join(lines)
+
+
+def _pe_status(net, project: str = "", session_slug: str = "") -> str:
+    """How far along an application project is, honestly."""
+    from ..pe import service as pe
+
+    slug = project or session_slug
+    if not slug:
+        return "error: give a project"
+    info = pe.import_status(net, slug)
+    if not info.get("application"):
+        return f"{slug} is not a Windows application project."
+    s = info["summary"]
+    lines = [f"{slug}: {len(info['modules'])} module(s), {s['functions']} functions",
+             f"  matched  {s['matched']}   (byte-identical)",
+             f"  compiled {s['compiled']}   (the compiler accepted the C in src/)",
+             f"  failed   {s['failed']}   (a draft exists and does not compile)",
+             f"  untried  {s['untried']}   (nothing written for it yet)",
+             f"  {s['stand_ins']} stand-in object(s) in build/ so objdiff can produce a report. "
+             f"Anything measured against those is not progress."]
+    for m in info["modules"]:
+        lines.append(f"  module {m['name']}: {m['functions']} functions, {m['kind']} {m['arch']}")
+    if s["with_errors"]:
+        lines.append("  first compiler errors:")
+        for r in [r for r in info["functions"] if r["error"]][:5]:
+            lines.append(f"    {r['symbol']}: {r['error']}")
+    return "\n".join(lines)
+
+
+def _pe_repair(net, module: str = "", project: str = "", symbol: str = "",
+                session_slug: str = "") -> str:
+    """Repair drafts that do not compile."""
+    from ..pe import service as pe
+
+    slug = project or session_slug
+    if not slug:
+        return "error: give a project"
+    symbols = [symbol] if symbol else None
+    result = pe.repair_functions(net, slug, module=module, symbols=symbols, log=lambda *_: None)
+    lines = [f"{result['repaired']} of {result['attempted']} draft(s) now compile"]
+    for o in result["outcomes"]:
+        lines.append(f"  {o['symbol']}: {o['before']} -> {o['after']}")
+        for r in o["repairs"]:
+            lines.append(f"    - {r['rule']}: {r['change']}" + ("  [ASSUMED]" if r.get("assumed") else ""))
+            lines.append(f"      why: {r['why']}")
+        for d in o["deferred"][:4]:
+            lines.append(f"    ! {d}")
+    if not result["attempted"]:
+        lines.append("  (nothing to repair: every draft compiles)")
+    return "\n".join(lines)
+
+
+def _pe_repair_history(net, project: str = "", symbol: str = "", session_slug: str = "") -> str:
+    """Every repair applied so far, with its justification and its assumptions."""
+    from ..pe import service as pe
+
+    slug = project or session_slug
+    if not slug:
+        return "error: give a project"
+    rows = pe.repair_module_history(Path(net.project_row(slug)["root"]))
+    if symbol:
+        rows = [r for r in rows if r["symbol"] == symbol]
+    if not rows:
+        return f"{slug}: no repairs recorded"
+    lines = [f"{slug}: {len(rows)} function(s) with a repair record"]
+    for r in rows:
+        lines.append(f"  {r['symbol']}: {r['before']} -> {r['after']}")
+        for x in r["repairs"]:
+            lines.append(f"    - {x['rule']}: {x['change']}" + ("  [ASSUMED]" if x.get("assumed") else ""))
+        for d in r["deferred"][:3]:
+            lines.append(f"    ! {d}")
+    return "\n".join(lines)
+
+
 HANDLERS: dict[str, Callable[..., str]] = {
     "project_info": lambda net, agent, slug: project_info(net, slug),
     "claim_function": lambda net, agent, slug, function="", strategy="", count=1:
@@ -200,6 +358,17 @@ HANDLERS: dict[str, Callable[..., str]] = {
     "file_status": lambda net, agent, slug, path: net.forks.file_status(_fork(net, slug, "file_status"), path),
     "split_file": lambda net, agent, slug, path, at, new_name="", data="":
         net.forks.split_file(agent, _fork(net, slug, "split_file"), path, at, new_name, data),
+    # Windows (PE64) application projects: the same pe/service.py the browser routes call.
+    "create_pe_project": lambda net, agent, slug, path, project_name="": _pe_create(net, path, project_name),
+    "add_pe_module": lambda net, agent, slug, path, project="": _pe_module_add(net, path, project, slug),
+    "list_pe_modules": lambda net, agent, slug, project="": _pe_modules(net, project, slug),
+    "get_pe_module_functions": lambda net, agent, slug, module, project="", status="":
+        _pe_functions(net, module, project, slug, status),
+    "get_pe_import_status": lambda net, agent, slug, project="": _pe_status(net, project, slug),
+    "repair_pe_draft": lambda net, agent, slug, module="", project="", symbol="":
+        _pe_repair(net, module, project, symbol, slug),
+    "get_pe_repair_history": lambda net, agent, slug, project="", symbol="":
+        _pe_repair_history(net, project, symbol, slug),
 }
 
 ROM_ONLY = {"get_context", "edit_context", "rename_symbol", "split_function"}
@@ -248,6 +417,19 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]])
             raise ToolError(str(e)) from None
         try:
             return await anyio.to_thread.run_sync(lambda: HANDLERS[name](net, agent, slug, **_named(net, agent, slug, args)))
+        except NetworkError as e:
+            raise ToolError(str(e)) from None
+
+    async def run_pe(ctx: Context, name: str, **args) -> str:
+        """Project-level tools that do not belong to whichever project the session is in:
+        creating one has to work before there is one."""
+        try:
+            agent, slug = agent_of(ctx)
+        except NetworkError:
+            agent, slug = None, ""
+        try:
+            return await anyio.to_thread.run_sync(
+                lambda: HANDLERS[name](net, agent, slug, **args))
         except NetworkError as e:
             raise ToolError(str(e)) from None
 
@@ -390,5 +572,79 @@ def build_mcp(net: RomNetwork, agent_of: Callable[[Context], tuple[Agent, str]])
     @mcp.prompt(title="Decompile", description="Work loop: claim functions and match them byte for byte.")
     def work(count: str = "5") -> str:
         return "Call project_info first, then follow the decomp.wtf work loop for up to " + count + " functions."
+
+    @mcp.tool(meta=ALWAYS_LOAD)
+    async def create_pe_project(ctx: Context, path: str, project_name: str = "") -> str:
+        """Create a project from a Windows EXE or DLL at a path on this computer.
+
+        Analysis is static: the file is read and disassembled, never run. Discovery, synthetic
+        objdiff targets and Ghidra drafts are generated, and the project opens like any other.
+        Do not send the file itself -- give a path the server can read.
+
+        Args:
+            path: full path to the .exe or .dll (e.g. /home/me/apps/app.exe)
+            project_name: optional name for the project (defaults to the file's name)
+        """
+        return await run_pe(ctx, "create_pe_project", path=path, project_name=project_name)
+
+    @mcp.tool(meta=ALWAYS_LOAD)
+    async def add_pe_module(ctx: Context, path: str, project: str = "") -> str:
+        """Add another EXE or DLL to an application project, keeping the modules already in it.
+
+        Sources, notes, claims, attempts and scores of the existing modules are untouched.
+
+        Args:
+            path: full path to the .exe or .dll
+            project: the project slug (defaults to the project this session is in)
+        """
+        return await run_pe(ctx, "add_pe_module", path=path, project=project)
+
+    @mcp.tool(meta=ALWAYS_LOAD)
+    async def list_pe_modules(ctx: Context, project: str = "") -> str:
+        """The modules of an application project: kind, architecture, image base and how many
+        functions each has."""
+        return await run_pe(ctx, "list_pe_modules", project=project)
+
+    @mcp.tool(meta=ALWAYS_LOAD)
+    async def get_pe_module_functions(ctx: Context, module: str, project: str = "", status: str = "") -> str:
+        """One module's functions, with where each one actually stands.
+
+        status is one of matched, compiled, failed, untried, or empty for all. 'compiled' means
+        the compiler accepted C someone wrote; an object in build/ that is not listed as compiled
+        is a stand-in put there so objdiff can run, and measuring against it is not progress.
+
+        Args:
+            module: the module name, as list_pe_modules gives it
+            project: the project slug (defaults to this session's)
+            status: filter by status
+        """
+        return await run_pe(ctx, "get_pe_module_functions", module=module, project=project, status=status)
+
+    @mcp.tool(meta=ALWAYS_LOAD)
+    async def get_pe_import_status(ctx: Context, project: str = "") -> str:
+        """How far along an application project is: modules, and functions matched / compiled /
+        draft-failed / untried, with the first compiler errors."""
+        return await run_pe(ctx, "get_pe_import_status", project=project)
+
+    @mcp.tool(meta=ALWAYS_LOAD)
+    async def repair_pe_draft(ctx: Context, module: str = "", symbol: str = "", project: str = "") -> str:
+        """Repair Ghidra drafts that do not compile, using the compiler's own diagnostics.
+
+        Deterministic and bounded: missing declarations, absent types and unknown globals are
+        supplied from the diagnostic and the name; nothing is invented to silence an error. A
+        source file a person has edited is left untouched. A repair that makes something compile
+        is still only a candidate -- objdiff decides whether it matches.
+
+        Args:
+            module: the module to repair (empty for all of them)
+            symbol: one function (empty for every draft that fails)
+            project: the project slug (defaults to this session's)
+        """
+        return await run_pe(ctx, "repair_pe_draft", module=module, symbol=symbol, project=project)
+
+    @mcp.tool(meta=ALWAYS_LOAD)
+    async def get_pe_repair_history(ctx: Context, symbol: str = "", project: str = "") -> str:
+        """Every repair applied to a project: what changed, why, and what was assumed."""
+        return await run_pe(ctx, "get_pe_repair_history", symbol=symbol, project=project)
 
     return mcp

@@ -1453,6 +1453,12 @@ class RomNetwork(Network):
     def _autopilot_run(self, slug: str, ids: list[int], state: dict, workers: int, try_one=None) -> None:
         from concurrent.futures import ThreadPoolExecutor
 
+        from . import pause as pause_mod
+
+        if pause_mod.is_paused(self, slug):
+            logging.getLogger("decomp.wtf").info("autopilot: %s is paused", slug)
+            state["phase"] = "paused"
+            return
         agent, _ = self.local_agent("autopilot")
         proj = self._project(slug)
         try_one = try_one or self._autopilot_one
@@ -1468,7 +1474,7 @@ class RomNetwork(Network):
         state["total"] = len(ids)
 
         def one(fid: int) -> None:
-            if state["stop"].is_set():
+            if state["stop"].is_set() or pause_mod.is_paused(self, slug):
                 return
             try:
                 outcome = try_one(agent, proj, fid)

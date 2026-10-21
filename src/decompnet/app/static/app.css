@@ -662,3 +662,21 @@ a.ghost, a.primary { text-decoration: none; }
 .nav-proj.broken .np-meta, .err-text { color: var(--miss); }
 .credit { margin: 10px 0 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--raise); color: var(--ink-2); max-width: 760px; }
 .credit a { color: inherit; }
+
+/* Windows (PE64) application projects: the module bar on a project page and the import log. */
+.pe-bar { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .35rem 0 .6rem; }
+.pe-mod { display: inline-flex; align-items: baseline; gap: .4rem; padding: .22rem .55rem;
+          border: 1px solid var(--line, #2a2c31); border-radius: 999px; font-size: .85rem; }
+.pe-mod b { font-weight: 600; }
+.pe-mod .muted { font-size: .78rem; }
+.pe-log { max-height: 16rem; overflow: auto; white-space: pre-wrap; font-size: .8rem;
+          line-height: 1.45; background: #0d0e11; border: 1px solid var(--line, #2a2c31);
+          border-radius: .4rem; padding: .6rem; margin: 0 0 .6rem; }
+.ghost.small { font-size: .8rem; padding: .2rem .6rem; }
+
+.pe-state { font-size: .75rem; letter-spacing: .06em; text-transform: uppercase; padding: .2rem .55rem;
+            border-radius: 999px; border: 1px solid var(--line, #2a2c31); }
+.pe-state.running { color: #7ee0a1; border-color: #2f6b46; }
+.pe-state.paused  { color: #ffd479; border-color: #6b5a2f; }
+.pe-state.stopped { color: #9aa0a6; }
+.warn { color: #ffd479; }

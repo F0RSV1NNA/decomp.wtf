@@ -2649,3 +2649,175 @@ loadNav();
 route();
 setTimeout(() => checkUpdate(false, true), 4000);
 setInterval(() => checkUpdate(false, true), 10 * 60 * 1000);
+
+
+/* ------------------------------------------------------- Windows (PE64) projects */
+
+/* An application project is a list of modules (an EXE and its DLLs), not one binary, so the
+   project view shows what it is made of and lets another module be added without disturbing
+   the ones already there. */
+function peModuleBar() {
+  return document.getElementById("peBar");
+}
+
+async function peLoad(slug) {
+  let st = null;
+  let data = { application: false, modules: [] };
+  try { st = await api(`/api/pause?slug=${encodeURIComponent(slug)}`); } catch (e) { /* no controls */ }
+  try { data = await api(`/api/pe/modules?slug=${encodeURIComponent(slug)}`); } catch (e) { /* not an application */ }
+  const tabs = document.querySelector(".tabs");
+  const old = peModuleBar();
+  if (old) old.remove();
+  if (!tabs || !tabs.parentElement) return;
+
+  const state = st ? st.state : "";
+  const when = st && st.paused_at ? new Date(st.paused_at * 1000).toLocaleString() : "";
+  const why = st && st.reason ? ` — ${esc(st.reason)}` : "";
+  const chip = st
+    ? `<span class="pe-state ${state}" title="${state === "paused"
+        ? `Paused ${esc(when)}${why}. API agents, autopilot and the Permuter will not run for this project.`
+        : state === "running" ? "Workers are running on this project."
+        : "Nothing is running on this project."}">${state}</span>`
+    : "";
+  const mods = (data.application ? data.modules : []).map((m) => {
+    const c = m.status || {};
+    const progress = `${c.compiled || 0} compiled` +
+      (c.stand_in ? ` · <span class="warn">${c.stand_in} stand-in</span>` : "") +
+      (c.with_draft ? ` · ${c.with_draft} draft` : "");
+    return `<span class="pe-mod" title="${esc(m.arch)} ${esc(m.kind)} · image base ${esc(m.image_base)} · sha1 ${esc(m.sha1.slice(0, 12))}${m.unresolved.length ? ` · imports not supplied: ${esc(m.unresolved.join(", "))}` : ""}"><b>${esc(m.name)}</b><span class="muted">${esc(m.kind)} · ${m.functions} fn</span><span class="muted">${progress}</span></span>`;
+  }).join("");
+  const pauseBtn = st
+    ? `<button class="ghost small" id="pePause" type="button">${st.paused ? "Resume" : "Pause"}${
+        st.paused && (st.was_running || []).length ? ` (${st.was_running.length} stopped)` : ""}</button>`
+    : "";
+  const addBtn = data.application
+    ? `<button class="ghost small" id="peAdd" type="button">Add module…</button>
+       <button class="ghost small" id="peStatus" type="button">Function status…</button>` : "";
+  const el = document.createElement("div");
+  el.id = "peBar";
+  el.className = "pe-bar";
+  el.innerHTML = chip + mods + pauseBtn + addBtn;
+  tabs.parentElement.insertBefore(el, tabs);
+
+  const p = el.querySelector("#pePause");
+  if (p) p.onclick = async () => {
+    p.disabled = true;
+    try {
+      const next = await api("/api/pause", { method: "POST", body: { slug, paused: !st.paused } });
+      toast(next.paused
+        ? `Paused ${slug}: ${(next.stopped || []).length ? "stopped " + next.stopped.join(", ") : "nothing was running"}`
+        : `Resumed ${slug}. Nothing restarts on its own — start agents when you want them.`);
+      await peLoad(slug);
+    } catch (e) { toast(`Could not change it: ${esc(e.message)}`, "err"); p.disabled = false; }
+  };
+  const a = el.querySelector("#peAdd");
+  if (a) a.onclick = () => peAddDialog(slug);
+  const sBtn = el.querySelector("#peStatus");
+  if (sBtn) sBtn.onclick = () => peStatusDialog(slug);
+}
+
+async function peStatusDialog(slug) {
+  const body = dialog("Function status", `<pre class="pe-log" id="peSt">building…</pre>
+    <p class="muted small">A stand-in is an object put in build/ so objdiff can produce a report.
+    It is not a candidate anyone wrote, and a percentage measured against it is not progress.</p>
+    <div class="row"><button class="ghost" data-close type="button">Close</button></div>`);
+  const out = body.querySelector("#peSt");
+  try {
+    const info = await api(`/api/pe/status?slug=${encodeURIComponent(slug)}`);
+    if (!info.application) { out.textContent = "not an application project"; return; }
+    const s = info.summary;
+    const lines = [`${slug}: ${info.modules.length} module(s), ${s.functions} functions`, "",
+      `  matched   ${String(s.matched).padStart(4)}   byte-identical`,
+      `  compiled  ${String(s.compiled).padStart(4)}   the compiler accepted the C in src/`,
+      `  failed    ${String(s.failed).padStart(4)}   a draft exists and does not compile`,
+      `  untried   ${String(s.untried).padStart(4)}   nothing written for it yet`, "",
+      `  ${s.stand_ins} stand-in object(s) in build/ so objdiff can run.`, ""];
+    for (const m of info.modules) {
+      const c = m.status || {};
+      lines.push(`  ${m.name} (${m.kind} ${m.arch}): ${m.functions} functions — ${c.compiled || 0} compiled, ${c.stand_in || 0} stand-in`);
+    }
+    const errs = info.functions.filter((f) => f.error);
+    if (errs.length) {
+      lines.push("", `  first compiler errors (${errs.length} draft(s) rejected):`);
+      for (const f of errs.slice(0, 12)) lines.push(`    ${f.symbol}: ${f.error}`);
+    }
+    out.textContent = lines.join("\n");
+  } catch (e) { out.textContent = `failed: ${e.message}`; }
+}
+
+function peNewDialog() {
+  const body = dialog("New Windows project",
+    `<p class="muted">Import an EXE or DLL. Analysis is static: the file is read and disassembled, never run.</p>
+     <label class="field"><span>Project name</span><input id="peName" placeholder="my-app"></label>
+     <label class="field"><span>File from this PC</span><input type="file" id="peFile" accept=".exe,.dll,.sys,.ocx"></label>
+     <label class="field"><span>or a path this computer can read</span><input id="pePath" class="mono" placeholder="/home/me/apps/app.exe"></label>
+     <div class="row"><button class="primary" id="peGo" type="button">Create project</button><button class="ghost" data-close type="button">Cancel</button></div>`);
+  body.querySelector("#peGo").onclick = () => {
+    const file = body.querySelector("#peFile").files[0] || null;
+    const path = body.querySelector("#pePath").value.trim();
+    if (!file && !path) { toast("Choose a file or give a path", "err"); return; }
+    const name = body.querySelector("#peName").value.trim() ||
+      (file ? file.name : path.split(/[\\/]/).pop()).replace(/\.[^.]+$/, "");
+    peRun({ name, file, path });
+  };
+}
+
+function peAddDialog(slug) {
+  const body = dialog("Add a module",
+    `<p class="muted">Another EXE or DLL in <b>${esc(slug)}</b>. Modules already imported keep their sources, notes, claims and scores.</p>
+     <label class="field"><span>File from this PC</span><input type="file" id="peFile" accept=".exe,.dll,.sys,.ocx"></label>
+     <label class="field"><span>or a path this computer can read</span><input id="pePath" class="mono" placeholder="/home/me/apps/plugin.dll"></label>
+     <div class="row"><button class="primary" id="peGo" type="button">Add module</button><button class="ghost" data-close type="button">Cancel</button></div>`);
+  body.querySelector("#peGo").onclick = () => {
+    const file = body.querySelector("#peFile").files[0] || null;
+    const path = body.querySelector("#pePath").value.trim();
+    if (!file && !path) { toast("Choose a file or give a path", "err"); return; }
+    peRun({ slug, file, path });
+  };
+}
+
+async function peRun({ slug = "", name = "", file = null, path = "" }) {
+  const q = new URLSearchParams();
+  if (slug) q.set("slug", slug);
+  if (name) q.set("name", name);
+  if (path) q.set("path", path);
+  const url = `${slug ? "/api/pe/module" : "/api/pe/import"}?${q.toString()}`;
+  const body = dialog(slug ? `Adding a module to ${slug}` : `Importing ${esc(name || "the file")}`,
+    `<pre class="pe-log" id="peLog">starting…</pre>
+     <p class="muted small">Disassembly and Ghidra drafts run as a job, so this keeps going if the tab does not.</p>
+     <div class="row"><button class="ghost" data-close type="button">Close</button></div>`);
+  const log = body.querySelector("#peLog");
+  const put = (text) => { log.textContent = text; log.scrollTop = log.scrollHeight; };
+  try {
+    const started = file
+      ? await uploadFile(url, file, (p) => put(`copying ${file.name} into decomp.wtf… ${(p * 100).toFixed(0)}%`))
+      : await api(url, { method: "POST", raw: new ArrayBuffer(0) });
+    const res = await followJob(started.job, null, (lines) => {
+      const shown = lines.filter((l) => l && l.trim()).slice(-14).join("\n");
+      if (shown) put(shown);
+    });
+    put(`${log.textContent.trim()}\n\n✓ ${res && res.slug ? res.slug : "done"}`);
+    await loadNav();
+    if (res && res.slug) location.hash = `#/p/${res.slug}`;
+    if (!slug) toast("Project created");
+  } catch (e) {
+    put(`${log.textContent.trim()}\n\n✗ ${e.message}`);
+    toast(`Import failed: ${esc(e.message)}`, "err");
+  }
+}
+
+$("peNewBtn").onclick = peNewDialog;
+
+/* The module bar belongs to the project view, so it is refreshed whenever a project is opened
+   rather than being wired into it: openProject stays the one place that decides what a project
+   page is. */
+try {
+  const peOpen = openProject;
+  openProject = function (...args) {
+    const done = peOpen.apply(this, args);
+    Promise.resolve(done).then(() => setTimeout(() => peLoad(S.slug), 250)).catch(() => {});
+    return done;
+  };
+} catch (e) {
+  /* if openProject cannot be wrapped, the bar simply does not appear: not worth breaking for */
+}

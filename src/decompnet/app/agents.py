@@ -26,6 +26,7 @@ from pathlib import Path
 
 import httpx
 
+from . import pause
 from . import tools
 from .engine import RomNetwork
 
@@ -542,6 +543,8 @@ class Manager:
     # -- control
 
     def start(self, kind: str, slug: str, count: int = 1, options: dict | None = None) -> list[str]:
+        if pause.is_paused(self.net, slug):
+            return []                      # nothing new is launched for a paused project
         options = dict(options or {})
         if kind_id(kind) != kind:
             kind = kind_id(kind)
@@ -575,6 +578,10 @@ class Manager:
         """Before agents claim: free matches from identical code (twins, in the background: what they'd match is
         left for last meanwhile), and on a GameCube/Wii decomp where code has no source file yet, files for it
         (start_files, checked against the game's checksum), or they'd all share the few hard functions left."""
+        if pause.is_paused(self.net, slug):
+            # a paused project must not restart its own helpers: this runs on every claim, so
+            # it is the one place a Permuter would otherwise come back from the dead
+            return
         try:
             self.net.twins.refresh(slug)
             self.net.permuter.start(slug)  # near misses agents leave, on spare CPU

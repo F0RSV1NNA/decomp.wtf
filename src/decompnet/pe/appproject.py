@@ -171,7 +171,8 @@ def create_application_project(dest: Path, name: str, *, log=print) -> dict:
 
 def add_module(dest: Path, binary: Path, *, name: str | None = None,
                drafts: dict[int, str] | None = None, cl: str | None = None,
-               no_inline: bool = True, log=print) -> dict:
+               no_inline: bool = True, log=print, should_stop=None, build: bool = True,
+               build_limit: int = 1500) -> dict:
     """Add one module to an application project, or refresh it if its content is already here.
 
     Nothing existing is removed. The module is analysed and written into a staging directory
@@ -208,7 +209,12 @@ def add_module(dest: Path, binary: Path, *, name: str | None = None,
 
     opt = "/Od" if no_inline else "/O2"
     funcs, unit_list = [], []
-    for fn in discover_module(img, module_name):
+    for n, fn in enumerate(discover_module(img, module_name)):
+        if should_stop and should_stop():
+            shutil.rmtree(stage, ignore_errors=True)
+            raise RuntimeError("stopped while building the module")
+        if n and n % 500 == 0:
+            log(f"{module_name}: {n} functions prepared")
         obj, relocs, tables, notes = table_aware_object(
             img, fn["rva"], fn["size"], fn["symbol"],
             next_rva=fn["end"] if fn["end"] > fn["rva"] else None)
@@ -257,8 +263,20 @@ def add_module(dest: Path, binary: Path, *, name: str | None = None,
     log(f"added {module_name} ({entry['kind']}, {len(funcs)} functions)")
 
     write_objdiff_and_build(dest, manifest)
-    run_build(dest, log=log)
-    seeded = seed_missing(dest, manifest)
+    if build and len(funcs) > build_limit:
+        # one object per unit means one cl.exe per unit: 30,000 of them is minutes of process
+        # thrashing for a result nobody asked for. Everything else about the project is ready.
+        log(f"{len(funcs)} functions is more than the {build_limit} this will compile in one go: "
+            f"the targets, sources and listings are all here. Compile a unit when you want its diff.")
+        build = False
+    if build:
+        run_build(dest, log=log)
+    else:
+        log("not compiling now")
+    # stand-ins exist so objdiff can report on a project that IS being compiled. For one too
+    # large to compile they are pure cost: tens of thousands of placeholder objects nobody asked
+    # for, in a project whose whole point is that it was not built.
+    seeded = seed_missing(dest, manifest) if build else []
     if seeded:
         log(f"seeded {len(seeded)} stand-in(s) for sources that do not build yet")
     write_readme(dest, manifest)
@@ -376,3 +394,44 @@ def write_inventory(dest: Path, manifest: dict) -> None:
                          f"{', '.join(hex(t) for t in f['jump_tables']) or '-'} |")
         lines.append("")
     (dest / "notes/functions.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def remap_calls(dest: Path, module: str, *, log=print) -> dict:
+    """Give every remaining FUN_<addr> in a module's sources a real name.
+
+    After _source_for, a draft that calls another function still refers to it as FUN_140001278.
+    If that address is a function this module recovered, the call becomes that symbol -- which is
+    how two functions in the same module end up calling each other by name. If it is not recovered
+    (an import, or something discovery missed) it is declared `extern`, so the draft compiles and
+    the address stays visible as exactly that.
+    """
+    entry = next((m for m in load_manifest(dest).get("modules", []) if m["name"] == module), None)
+    if entry is None:
+        raise ValueError(f"no module {module} in this project")
+    base = int(entry["image_base"], 16)
+    by_rva = {f["rva"]: f["symbol"] for f in entry.get("functions", [])}
+
+    renamed = unresolved = 0
+    for src in sorted((dest / "src" / module).glob("*.c")):
+        text = src.read_text(encoding="utf-8")
+        refs = sorted(set(re.findall(r"\bFUN_([0-9a-fA-F]{6,})\b", text)))
+        if not refs:
+            continue
+        externs = []
+        for hexaddr in refs:
+            addr = int(hexaddr, 16)
+            symbol = by_rva.get(addr - base if addr >= base else addr)
+            if symbol:
+                text = re.sub(rf"\bFUN_{hexaddr}\b", symbol, text)
+                renamed += 1
+            else:
+                externs.append(f"extern void FUN_{hexaddr}(void);   /* not recovered */")
+                unresolved += 1
+        if externs:
+            lines = text.splitlines()
+            at = 1 if lines and lines[0].startswith("#include") else 0
+            text = "\n".join(lines[:at] + externs + lines[at:]) + "\n"
+        src.write_text(text, encoding="utf-8")
+    log(f"{module}: {renamed} call reference(s) mapped to recovered symbols, "
+        f"{unresolved} left as extern addresses")
+    return {"renamed": renamed, "unresolved": unresolved}
