@@ -132,7 +132,7 @@ def decompile_object(obj: Path, cache_dir: Path, timeout: float = 900) -> dict[s
 _NO_DECOMPILER = ("decompile does not exist", "decompile.exe does not exist", "Decompiler executable may not be compatible")
 
 
-def functions(program: Path, timeout: float = 3600) -> list[dict]:
+def functions(program: Path, timeout: float = 3600, *, require_conventions: bool = True) -> list[dict]:
     """Every function Ghidra's analysis finds in a whole program (a Windows .exe: Ghidra reads its imports, exports and
     the C runtime's functions too): {"entry", "end", "name", "source", "purge", "convention", "params", "thunk"}.
 
@@ -148,7 +148,8 @@ def functions(program: Path, timeout: float = 3600) -> list[dict]:
     rows = _run_script(program, "DecompWtfFunctions.java", timeout, said=said)
     why = next((ln.strip() for ln in said if any(s in ln for s in _NO_DECOMPILER)), None)
     found = [r for r in rows if not r.get("thunk")]
-    if why is None and found and all(r.get("convention") in ("unknown", "null", None) for r in found):
+    if require_conventions and why is None and found and all(
+            r.get("convention") in ("unknown", "null", None) for r in found):
         why = "no function it found got a calling convention"
     if why is not None:
         raise ForkError(f"Ghidra's decompiler didn't run ({why}), and without it Ghidra can't tell the functions' "

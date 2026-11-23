@@ -92,6 +92,8 @@ softwareupdate --install-rosetta
 For PS2 Sony EE-GCC, run `brew install colima docker`, then choose **Prepare Linux runner** in Compilers & tools ([setup](docs/linux-compiler-vm.md)).
 Linux-only PS1 compilers need a Linux computer. Xcode Command Line Tools (`xcode-select --install`) are needed for some Mac tools.
 
+For an IDA-backed Windows x64 project with MinGW-w64, see the [setup and collaboration guide](docs/windows-mingw-ida.md).
+
 ## Start
 Type `decomp`, or open decompdecomp from your apps menu. It opens in its own window.
 

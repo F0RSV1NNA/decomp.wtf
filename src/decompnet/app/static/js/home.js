@@ -377,6 +377,28 @@ function notSupported(head, file) {
 const TRY_AND_TELL = `This version is new, so <a href="https://github.com/n-delic/decompdecomp/issues" target="_blank" rel="noopener">tell us how it goes</a> on your game.`;
 const NOT_A_GAME = "That isn't a game file decompdecomp can start from scratch (yet). For other platforms, continue a public decomp.";
 
+async function mingwVersion(head, file) {
+  const view = new DataView(head.buffer, head.byteOffset, head.byteLength);
+  const pe = view.getUint32(0x3c, true);
+  if (pe + 24 > head.length) return null;
+  const count = view.getUint16(pe + 6, true);
+  const start = pe + 24 + view.getUint16(pe + 20, true);
+  const decoder = new TextDecoder();
+  const versions = new Set();
+  for (let i = 0; i < count; i++) {
+    const at = start + 40 * i;
+    if (at + 40 > head.length) return null;
+    if (decoder.decode(head.subarray(at, at + 8)).replace(/\x00+$/, "") !== ".rdata") continue;
+    const size = view.getUint32(at + 16, true);
+    const offset = view.getUint32(at + 20, true);
+    const data = decoder.decode(await file.slice(offset, offset + size).arrayBuffer());
+    for (const match of data.matchAll(/GCC: \(Rev\d+, Built by MSYS2 project\) (\d+\.\d+\.\d+)\x00/g)) {
+      versions.add(match[1]);
+    }
+  }
+  return versions.size === 1 ? versions.values().next().value : null;
+}
+
 async function pickFile(file, extras = []) {
   const head = new Uint8Array(await file.slice(0, 0x9400).arrayBuffer());
   // dropped before the page finished loading: the state first, as what the file is needs it (a PC program's pack is
@@ -390,6 +412,9 @@ async function pickFile(file, extras = []) {
     try { info = parseRom(buf); info.platform = "n64"; } catch (e) {
       return toast(esc(NOT_A_GAME), "err");
     }
+  }
+  if (info.platform === "win32" && info.target === "x64") {
+    info.mingw = await mingwVersion(head, file);
   }
   // Send only the sidecars this console reads beside its uploaded program.
   picked = { buf, info, name: file.name, extras: extras.filter((f) => info.platform === "win32" ? /\.(pdb|map)$/i.test(f.name)
@@ -451,6 +476,12 @@ function setupCompilers(info) {
     .map((v) => `<option value="${esc(v.id)}" ${chosen(c, v) ? "selected" : ""}>${esc(v.name)}</option>`).join("");
   select.innerHTML = shown.map((c) => `<optgroup label="${esc(c.name)}">${options(c)}</optgroup>`).join("")
     + (con.default_compiler ? "" : `<option value="" selected>Let decompdecomp pick (from the program itself)</option>`);
+  if (info.mingw) {
+    $("compilerRow").hidden = true;
+    note.hidden = false;
+    note.textContent = `Detected MSYS2 GCC ${info.mingw}. Import uses the matching MinGW-w64 g++ on PATH.`;
+    return;
+  }
   const pack = packOf(info);
   note.hidden = false;
   note.textContent = con.import_error || con.import_note || (pack ? cwPack(pack).note : "This project uses its console's compiler. Install it in Compilers & tools before importing.");

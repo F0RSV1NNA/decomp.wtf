@@ -144,10 +144,11 @@ class WindowsPC(Console):
     def default_compiler(self, info: dict, splat_guess: str) -> str:
         return ""  # the program's Rich header says which Visual C++ built it (scratch.guess_compiler)
 
-    def create_project(self, root: Path, game: Path, *, compiler: str | None = None, log=print) -> dict:
+    def create_project(self, root: Path, game: Path, *, compiler: str | None = None, log=print,
+                       ida_analysis: Path | None = None) -> dict:
         from . import scratch
 
-        return scratch.create(root, game, compiler=compiler, log=log, args=self.tool_args())
+        return scratch.create(root, game, compiler=compiler, log=log, args=self.tool_args(), ida_analysis=ida_analysis)
 
     def game_info(self, game: Path) -> dict:
         from . import scratch
@@ -297,10 +298,34 @@ class WindowsPC(Console):
         if scratch.missing(fp.root, manifest["version"]):
             raise NetworkError("the project is missing the game's DLLs it was made with (in orig/): put your copies "
                                "there, then reimport")
-        scratch.ensure_ghidra(log)  # (as the import does: a Mac's Ghidra without its decompiler is installed again)
-        log(f"analysing {game.name} with Ghidra again (a big game takes a few minutes)")
-        found = {"": ghidra.functions(game)}
-        for m in _functions_json(fp, manifest["version"]).get("modules", []):
+        ida_path = fp.root / ".decomp-wtf" / "ida-functions.json"
+        modules = _functions_json(fp, manifest["version"]).get("modules", [])
+        if manifest.get("analysis_provider") == "ida":
+            ok, dirty = fp.git("status", "--porcelain", "--", "config")
+            if not ok or dirty:
+                raise NetworkError("Commit project config changes before reanalysing with IDA")
+            import json
+
+            try:
+                analysis = json.loads(ida_path.read_text(encoding="utf-8"))
+                rows = analysis["functions"]
+                if analysis["sha1"] != manifest["game"]["sha1"] or not rows or not all(
+                    isinstance(row["entry"], int) and isinstance(row["end"], int)
+                    and row["end"] > row["entry"] for row in rows
+                ):
+                    raise ValueError("the export is empty or belongs to another binary")
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                raise NetworkError(f"Refresh the IDA analysis export: {error}") from error
+            if modules:
+                raise NetworkError("This IDA export covers one PE. Reanalysis of companion DLLs needs their own exports.")
+            log(f"reanalysing {game.name} from {len(rows):,} IDA function entries")
+            found = {"": rows}
+        else:
+            scratch.ensure_ghidra(log)
+            log(f"analysing {game.name} with Ghidra again (a big game takes a few minutes)")
+            rows = ghidra.functions(game, require_conventions=False) if self.target(fp) == "x64" else ghidra.functions(game)
+            found = {"": rows}
+        for m in modules:
             log(f"analysing {m['exe'].removeprefix('orig/')} with Ghidra again")
             found[m["name"]] = scratch.module_rows(ghidra, fp.root / m["exe"], m["image_base"] - m["preferred_base"])
         matched = {r["name"] for r in net.store.all("SELECT name FROM functions WHERE project_id=? AND "
@@ -343,10 +368,18 @@ class WindowsPC(Console):
 
     # Each source file can have its own Visual C++ (config/<version>/file_compilers.json, which tools/configure.py
     # reads): a game's Rich header often counts objects of two versions (6.0 and 7.1), as DS games mix CodeWarrior's
+    def project_compilers(self, fp) -> list[Compiler]:
+        compiler = (fp.manifest or {}).get("compiler", "")
+        if compiler.startswith("GCC/"):
+            return [Compiler(compiler, f"MinGW-w64 GCC {compiler.removeprefix('GCC/')}", target="x64")]
+        return super().project_compilers(fp)
+
     def file_compiler(self, fp, source: str) -> str | None:
         from . import scratch
 
         manifest = fp.manifest or {}
+        if manifest.get("compiler", "").startswith("GCC/"):
+            return None
         # a project made before (its configure.py reads no map until on_start brings its tools up to date)
         if "version" not in manifest or not scratch.compilers_file(fp.root, manifest["version"]).exists():
             return None
@@ -401,6 +434,8 @@ class WindowsPC(Console):
         from . import scratch
 
         manifest = fp.manifest or {}
+        if manifest.get("compiler", "").startswith("GCC/"):
+            return []
         path = fp.root / manifest.get("game", {}).get("path", f"orig/{manifest.get('version')}.exe")
         paths = [path, *(fp.root / m["exe"] for m in _functions_json(fp, manifest.get("version", "")).get("modules", []))]
         counted: dict[str, list] = {}

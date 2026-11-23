@@ -321,12 +321,47 @@ def shortcut(args) -> int:
     return 0
 
 
+def import_ida(args) -> int:
+    """Start a Windows project from a local IDA export without using Ghidra."""
+    from .. import consoles
+    from ..forks.project import ForkError
+    from ..network import NetworkError
+    from .engine import RomNetwork
+
+    workspace = home_dir()
+    if _alive(args.port):
+        print("Close decompdecomp before importing with this command.", file=sys.stderr)
+        return 1
+    if not args.confirm_own_copy:
+        print("Confirm that you own this copy with --confirm-own-copy.", file=sys.stderr)
+        return 1
+    try:
+        game = args.program.expanduser().resolve(strict=True)
+        analysis = args.export.expanduser().resolve(strict=True)
+        if analysis.name != "ida-functions.json" or not analysis.is_file() or not game.is_file():
+            raise ValueError("Pass the program file and the exported ida-functions.json")
+        if consoles.identify(game).id != "pc":
+            raise ValueError("The IDA importer requires a Windows PE")
+        (workspace / ".decomp").mkdir(parents=True, exist_ok=True)
+        net = RomNetwork(workspace / ".decomp" / "decomp.db", workspace)
+        slug = net.forks.create_scratch(game, consoles.get("pc"), options={"ida_analysis": analysis})
+        print(f"IDA project ready: {slug}")
+    except (OSError, ValueError, ForkError, NetworkError) as error:
+        print(f"IDA import failed: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="decomp", description="decompdecomp: AI agents decompile the games you own, byte for byte")
     ap.add_argument("--port", type=int, default=edition.FIRST_PORT, help=argparse.SUPPRESS)
     # what 1.0.2 and older pass when they restart into an update: refusing it would end the app mid-update
     ap.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
     sub = ap.add_subparsers(dest="cmd")
+    ida = sub.add_parser("import-ida", help="start a Windows project from an IDA export")
+    ida.add_argument("program", type=Path)
+    ida.add_argument("export", type=Path, help="path to ida-functions.json")
+    ida.add_argument("--confirm-own-copy", action="store_true")
     sub.add_parser("setup", help="install the compilers and tools this computer needs")
     sub.add_parser("stop", help="quit the running app (and every helper it started)")
     sub.add_parser("shortcut", help="add decompdecomp to your apps menu")
@@ -341,7 +376,7 @@ def main(argv: list[str] | None = None) -> int:
     __import__("decompnet").utf8_output()
     __import__("decompnet.limits").limits.no_core_dumps()
     return {"setup": setup, "stop": stop, "shortcut": shortcut, "update": update_cmd,
-            "install-info": install_info}.get(args.cmd, run)(args)
+            "install-info": install_info, "import-ida": import_ida}.get(args.cmd, run)(args)
 
 
 if __name__ == "__main__":

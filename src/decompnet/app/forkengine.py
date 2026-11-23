@@ -25,6 +25,7 @@ from bisect import bisect_left
 from collections import defaultdict
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from .. import arch, classes, coffobj, consoles, similarity, structs, toolchains
@@ -820,11 +821,18 @@ class ForkEngine:
         scoped = {"scope": scope or GAME} if console.sets_aside else {}
         info = console.game_info(game)
         sha1 = info["sha1"]
+        gcc = info.get("gcc") if compiler is None else None
+        ida = bool((options or {}).get("ida_analysis"))
         for p in self.net.store.all("SELECT slug, config FROM projects"):
-            if json.loads(p["config"]).get("program_sha1") == sha1:
+            existing = json.loads(p["config"])
+            same_provider = not ida or existing.get("analysis_provider") == "ida"
+            if same_provider and existing.get("program_sha1") == sha1 and (not gcc or existing.get("compiler") == f"GCC/{gcc}"):
                 log(f"already set up as {p['slug']}")
                 return p["slug"]
-        slug = self._free_slug(_slug(f"{info['title']} {info['id']}" if info.get("kind") != "dol" else info["title"]))
+        label = f"{info['title']} {info['id']}" if info.get("kind") != "dol" else info["title"]
+        if ida:
+            label += " IDA"
+        slug = self._free_slug(_slug(label))
         dest = self.net.workspace / slug
         try:
             facts = console.create_project(dest, game, compiler=compiler, log=log, **scoped, **(options or {}))
@@ -839,7 +847,9 @@ class ForkEngine:
                "legal": {"basis": "personal-copy", "license": "personal use only",
                          "statement": "imported by the owner of this copy of the game, who confirmed it was legally obtained",
                          "confirmed_at": time.time()}}
-        self._register(slug, facts["title"], f"{consoles.name(facts['platform'])} game {facts['id']}, from scratch",
+        if ida:
+            cfg["analysis_provider"] = "ida"
+        self._register(slug, facts["title"] + (" (IDA)" if ida else ""), f"{consoles.name(facts['platform'])} game {facts['id']}, from scratch",
                        dest, cfg, f"started {facts['id']} from scratch")
         self.check(slug, log=log)
         return slug
@@ -2643,6 +2653,9 @@ class ForkEngine:
                 lines += ["", "### Machine draft (Ghidra's, made to compile here; often wrong in types and details; "
                               "redraft(function, context) makes it again with your declarations)", "```cpp",
                           (made[0] + "\n" if made[0] else "") + made[1].strip(), "```"]
+            elif seed and seed.startswith("/* Hex-Rays (whole module) */"):
+                lines += ["", "### Hex-Rays pseudocode from the whole module", "```cpp",
+                          seed.partition("\n")[2].strip(), "```"]
             elif seed:
                 lines += ["", "### Machine draft: a starting point, often wrong in types and details", "```c",
                           self._method_draft(fp, cfg, fn, seed).strip(), "```"]
@@ -2717,15 +2730,77 @@ class ForkEngine:
                         "```c", src.strip(), "```"]
         return out
 
+    @staticmethod
+    @lru_cache(maxsize=4)
+    def _hexrays_export(path: Path, fingerprint: tuple[int, int], sha1: str) -> dict:
+        """Read an optional, project-local export produced by Hex-Rays."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("sha1") == sha1 and isinstance(data.get("drafts"), dict):
+                return data["drafts"]
+        except (OSError, ValueError):
+            pass
+        return {}
+
+    @classmethod
+    def _hexrays(cls, fp: ForkProject) -> tuple[dict, str]:
+        manifest = fp.manifest or {}
+        sha1 = (manifest.get("game") or {}).get("sha1")
+        if manifest.get("platform") != "pc" or not sha1:
+            return {}, ""
+        path = fp.root / STATE / "hexrays-drafts.json"
+        try:
+            stat = path.stat()
+        except OSError:
+            return {}, ""
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        drafts = cls._hexrays_export(path, stamp, sha1)
+        return drafts, f"hexrays:{stamp[0]}:{stamp[1]}:" if drafts else ""
+
+    @staticmethod
+    @lru_cache(maxsize=4)
+    def _pc_addresses(path: Path, fingerprint: tuple[int, int]) -> dict:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {(unit, entry["name"]): entry["addr"]
+                    for unit, entries in data["units"].items() for entry in entries}
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+
+    @classmethod
+    def _hexrays_address(cls, fp: ForkProject, fn, symbol: str) -> int | None:
+        if fn["vram"] is not None:
+            return fn["vram"]
+        version = (fp.manifest or {}).get("version")
+        if not version:
+            return None
+        path = fp.root / "config" / version / "functions.json"
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return cls._pc_addresses(path, (stat.st_mtime_ns, stat.st_size)).get((fn["unit"], symbol))
+
     def _draft(self, proj, fp: ForkProject, cfg: dict, fn, unit) -> str | None:
         """m2c draft from the project's assembly for this function (Ghidra's from its target object where m2c can't
         read the code), cached in the database. A console with drafts of its own (Ghidra's: PC) keys it by the unit's
         target object: a join, a split or a repair of the analysis changes that, and the draft is made again."""
-        key = self._draft_key(cfg, unit)
+        ida_drafts, revision = self._hexrays(fp)
+        key = self._draft_key(cfg, unit, self._ida_revision(fp, revision))
         if fn["seed"] is not None and fn["seed_key"] == key:
             return fn["seed"] or None
         hint = (unit.scratch or {}).get("compiler", "") or json.dumps(fp.needs(cfg.get("version")))
         meta = self._meta(fn)
+        address = self._hexrays_address(fp, fn, meta.get("symbol") or fn["name"]) if ida_drafts else None
+        ida_text = ida_drafts.get(str(address))
+        if cfg.get("platform") == "pc" and (fp.manifest or {}).get("analysis_provider") == "ida":
+            text = ("/* Hex-Rays (whole module) */\n" + ida_text
+                    if isinstance(ida_text, str) and ida_text.strip() else "")
+            with self.net.store.tx() as db:
+                db.execute("UPDATE functions SET seed=?, seed_key=? WHERE id=?", (text, key, fn["id"]))
+            return text or None
+        if isinstance(ida_text, str) and ida_text.strip():
+            return "/* Hex-Rays (whole module) */\n" + ida_text
         try:
             text = drafts.draft(fp.root, cfg.get("platform") or "", unit.name, meta.get("symbol") or fn["name"],
                                 unit.source, compiler_hint=hint)
@@ -2742,13 +2817,17 @@ class ForkEngine:
         return text
 
     @staticmethod
-    def _draft_key(cfg: dict, unit) -> str | None:
+    def _ida_revision(fp: ForkProject, revision: str) -> str:
+        return "ida-only:" + revision if (fp.manifest or {}).get("analysis_provider") == "ida" else revision
+
+    @staticmethod
+    def _draft_key(cfg: dict, unit, revision: str = "") -> str | None:
         """What a function's machine draft is made from, where that changes (Console.own_drafts: its unit's target
         object, which Ghidra drafts): None elsewhere, a draft made once."""
         if not consoles.get(cfg.get("platform")).own_drafts or unit.target is None:
             return None
         try:
-            return hashlib.sha1(unit.target.read_bytes()).hexdigest()[:16]
+            return revision + hashlib.sha1(unit.target.read_bytes()).hexdigest()[:16]
         except OSError:
             return None
 
@@ -2760,7 +2839,8 @@ class ForkEngine:
         tries them)."""
         cfg = json.loads(proj["config"])
         return (cfg.get("origin") == "scratch" and bool(cfg.get("ready"))
-                and consoles.get(cfg.get("platform")).own_drafts and ghidra.available())
+                and consoles.get(cfg.get("platform")).own_drafts
+                and (cfg.get("analysis_provider") == "ida" or ghidra.available()))
 
     def stale_drafts(self, proj) -> list[int]:
         """Open functions whose machine draft is missing or was made from another target object, a unit after
@@ -2770,10 +2850,11 @@ class ForkEngine:
         rows = self.net.store.all("SELECT id, unit, seed, seed_key FROM functions WHERE project_id=? AND "
                                   "status='open' ORDER BY unit, n_insns", proj["id"])
         keys = {}
+        _, revision = self._hexrays(fp)
         for r in rows:
             if r["unit"] not in keys:
                 try:
-                    keys[r["unit"]] = self._draft_key(cfg, fp.unit(r["unit"]))
+                    keys[r["unit"]] = self._draft_key(cfg, fp.unit(r["unit"]), self._ida_revision(fp, revision))
                 except (ForkError, KeyError):
                     keys[r["unit"]] = None
         stale = [r["id"] for r in rows if r["seed"] is None or r["seed_key"] != keys[r["unit"]]]
@@ -2806,6 +2887,8 @@ class ForkEngine:
                                "this project, write from the brief's draft")
         if not context.strip():
             raise NetworkError("pass the declarations to draft with in `context` (a class, a prototype, an extern)")
+        if (fp.manifest or {}).get("analysis_provider") == "ida":
+            raise NetworkError("Update declarations in IDA and run export_hexrays.py to refresh the Hex-Rays draft")
         if not ghidra.available():
             raise NetworkError("redraft needs Ghidra, which makes PC games' drafts: the user can install it in Setup")
         fn = self._fn(slug, function)

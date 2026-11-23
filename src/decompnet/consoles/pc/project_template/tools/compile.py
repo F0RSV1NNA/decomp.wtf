@@ -107,7 +107,8 @@ def main() -> int:
     """Keep the compiler's arguments intact, and never rename symbols after a failed compile."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--compiler", required=True)
-    parser.add_argument("--include", required=True, action="append")  # each searched in turn: Visual C++'s, an SDK's
+    parser.add_argument("--gcc", action="store_true")
+    parser.add_argument("--include", default=[], action="append")  # each searched in turn: Visual C++'s, an SDK's
     parser.add_argument("--config", required=True)
     parser.add_argument("--wrapper", default="")  # wibo
     parser.add_argument("--wine", action="store_true")  # through wine: Visual C++ 2015+ (configure.py's WINE_FROM)
@@ -125,7 +126,12 @@ def main() -> int:
     command = ([wine] if wine else [args.wrapper] if args.wrapper else []) + [
         args.compiler, *flags, f"/I{path('include')}", *(f"/I{path(d)}" for d in args.include),
         f"/Fo{path(args.output)}", path(args.source)]
-    extra = _dll_dirs(args.compiler)
+    if args.gcc:
+        env = dict(os.environ)
+        env["PATH"] = os.pathsep.join([str(Path(args.compiler).resolve().parent), env.get("PATH", "")])
+        command = [args.compiler, *flags, "-Iinclude", *(f"-I{d}" for d in args.include),
+                   "-c", args.source, "-o", args.output]
+    extra = [] if args.gcc else _dll_dirs(args.compiler)
     if extra:
         current = env if env is not None else dict(os.environ)
         current["WINEPATH"] = _winepath_from_dirs(extra, current.get("WINEPATH", ""))

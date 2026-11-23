@@ -32,12 +32,15 @@ CL_FLAGS = ["/nologo", "/c", "/O2", "/W3", "/GX"]  # /GX: C++ exceptions, as gam
 # HarnessEntry compiles with CL_FLAGS plus /GL and links in harness mode (tools/ltcg.py, run through wine); the rest
 # compile with CL_FLAGS alone.
 LTCG = False
+GCC_FLAGS = ["-O2"]
 
 ROOT = Path(__file__).resolve().parent.parent
 os.chdir(ROOT)
 parser = argparse.ArgumentParser(description="Writes build.ninja and objdiff.json")
 parser.add_argument("version", help="game version (a directory in config/)")
-parser.add_argument("--msvc", required=True, action="append",
+backend = parser.add_mutually_exclusive_group(required=True)
+backend.add_argument("--gcc", help="MinGW-w64 g++ executable")
+backend.add_argument("--msvc", default=[], action="append",
                     help="Visual C++ directory (holds 6.0/Bin/CL.EXE, 10.0SP1/Bin/cl.exe, ...); several: the first "
                          "with MSVC_VERSION")
 parser.add_argument("--wibo", default="", help="runs the Windows compilers on Linux and macOS")
@@ -172,8 +175,11 @@ def main() -> None:
         compiler = [PYTHON, "tools/compile.py", "--config", CONFIG.as_posix()]
         # The runner invokes the compiler and names.py separately: cmd /c misparsed quoted compiler paths.
         # $runner: what runs the file's compiler (wibo, wine or nothing: runner())
+        flags = GCC_FLAGS if args.gcc else CL_FLAGS
+        if args.gcc:
+            compiler.append("--gcc")
         n.rule("cl", q(compiler).replace("$", "$$") + " $runner --compiler $cl $includes --output $out "
-               "--source $in -- " + q(CL_FLAGS).replace("$", "$$") + " $cflags")
+               "--source $in -- " + q(flags).replace("$", "$$") + " $cflags")
         n.rule("configure", f"{PY} tools/configure.py " + q(sys.argv[1:]).replace("$", "$$"), generator=True)
         n.rule("facts", f"{PY} tools/configure.py " + q([*sys.argv[1:], "--facts"]).replace("$", "$$"), restat=True,
                description="configure: which files there are")
@@ -201,11 +207,11 @@ def main() -> None:
             obj = (BUILD / src.with_suffix(".obj")).as_posix()
             src_posix = src.as_posix()
             version = versions.get(src_posix, MSVC_VERSION)
-            cl, includes = msvc(version)
+            cl, includes = (args.gcc, []) if args.gcc else msvc(version)
             n.build(obj, "cl", src_posix, implicit=[*headers, CONFIG.as_posix(), "tools/compile.py", "tools/names.py"],
                     variables={"cl": q([cl]).replace("$", "$$"),
                                "includes": q([a for d in includes for a in ("--include", d)]).replace("$", "$$"),
-                               "runner": q(runner(version)).replace("$", "$$"),
+                               "runner": "" if args.gcc else q(runner(version)).replace("$", "$$"),
                                "cflags": q(more.get(src_posix, [])).replace("$", "$$")})
             objs.append(obj)
         n.build("all_source", "phony", objs)

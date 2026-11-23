@@ -39,6 +39,7 @@ import functools
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import shutil
 import struct
@@ -593,6 +594,47 @@ def program_compilers(data: bytes) -> list[tuple[str, int, str, bool]]:
     return out
 
 
+def mingw_version(pe: PE) -> str | None:
+    """Recognize the MSYS2 GCC compiler identity carried by x64 PE objects."""
+    if not pe.x64:
+        return None
+    versions = {
+        v.decode("ascii") for section in pe.sections
+        if section.name == ".rdata"
+        for v in re.findall(rb"GCC: \(Rev\d+, Built by MSYS2 project\) (\d+\.\d+\.\d+)\x00",
+                            pe.data[section.offset:section.offset + section.size])
+    }
+    return next(iter(versions)) if len(versions) == 1 else None
+
+
+def mingw_compiler(version: str, runtime: str | None) -> str:
+    """Find a MinGW-w64 driver with the detected GCC version and C runtime."""
+    def probe(driver: str, *args: str) -> str:
+        return subprocess.check_output([driver, *args], input="", text=True, timeout=10,
+                                       stderr=subprocess.DEVNULL, creationflags=NO_WINDOW).strip()
+
+    search = os.get_exec_path()
+    default_msys = Path(os.environ.get("SystemDrive", "C:") + "/msys64")
+    search.extend(str(default_msys / profile / "bin") for profile in ("mingw64", "ucrt64"))
+    for directory in dict.fromkeys(search):
+        driver = shutil.which("g++", path=directory)
+        if not driver:
+            continue
+        try:
+            if probe(driver, "-dumpmachine") != "x86_64-w64-mingw32" or probe(driver, "-dumpfullversion") != version:
+                continue
+            if runtime:
+                macros = probe(driver, "-dM", "-E", "-include", "_mingw.h", "-x", "c++", "-")
+                ucrt = bool(re.search(r"^#define _UCRT\b", macros, flags=re.M))
+                if ucrt != (runtime == "ucrt"):
+                    continue
+            return driver
+        except (OSError, subprocess.SubprocessError):
+            continue
+    label = f" ({runtime})" if runtime else ""
+    raise ForkError(f"Add MSYS2 MinGW-w64 g++ {version}{label} for x86_64-w64-mingw32 to PATH and reopen decompdecomp")
+
+
 def game_info(path: Path) -> dict:
     """The game's facts, after its headers say decompdecomp can start it (a ForkError says why not)."""
     data = path.read_bytes()
@@ -601,6 +643,14 @@ def game_info(path: Path) -> dict:
         raise ForkError(f"decompdecomp can't start this program: {'; and '.join(why)}.")
     pe = read_pe(data)
     stem = re.sub(r"[^a-z0-9]+", "", path.stem.lower()) or "game"
+    if gcc := mingw_version(pe):
+        libraries = [name.lower() for name in pe.dlls]
+        runtime = ("ucrt" if any(name == "ucrtbase.dll" or name.startswith("api-ms-win-crt-") for name in libraries)
+                   else "msvcrt" if "msvcrt.dll" in libraries else None)
+        return {"platform": "pc", "id": stem, "title": path.stem, "region": "PC",
+                "sha1": hashlib.sha1(data).hexdigest(), "timestamp": pe.timestamp,
+                "compiler": built.pack_version, "gcc": gcc, "gcc_runtime": runtime, "compiler_why": f"embedded MSYS2 GCC {gcc} signature",
+                "summary": f"64-bit (x64), MSYS2 GCC {gcc}", "cannot_match": [], "exact": False, "target": "x64"}
     version = built.pack_version
     exact = built.exact  # (the packs' very build, or a copy of the user's own of it)
     if built.version is None:
@@ -1200,7 +1250,7 @@ _WHOLE_REGISTER = {**{n: f"r{x}x" for x in "abcd" for n in (f"{x}l", f"{x}h", f"
 
 
 def _whole_register(ins, reg: int) -> str:
-    name = ins.reg_name(reg)
+    name = ins.reg_name(reg) or ""
     return _WHOLE_REGISTER.get(name, name.rstrip("bdw") if name[:1] == "r" and name[1:2].isdigit() else name)
 
 
@@ -2377,6 +2427,8 @@ def file_ranges(root: Path, version: str) -> dict[str, list[tuple[int, int]]]:
 def set_own_compiler(root: Path, manifest: dict, compiler: str, sources: list[str]) -> list[str]:
     """`compiler` ("MSVC/7.1") as the project's own (tools/configure.py's MSVC_VERSION and the manifest's), every
     source file keeping the version it has: the map then names the files built with another."""
+    if manifest.get("compiler", "").startswith("GCC/"):
+        raise ForkError("The MinGW-w64 compiler is set for the entire project")
     version, new = manifest["version"], compiler.removeprefix("MSVC/")
     found = file_compilers(root, version)
     old = manifest.get("compiler", f"MSVC/{MSVC_DEFAULT}").removeprefix("MSVC/")
@@ -2532,7 +2584,7 @@ def compiler_pack(version: str) -> str:
 
 # the lines of tools/configure.py a project keeps when its tools are brought up to date: what create (and the
 # Settings panel, set_own_compiler) wrote for the game, and the flags its README says the user may change
-KEPT_SETTINGS = (r'^MSVC_VERSION = "[^"]*"', r"^CL_FLAGS = \[[^\]]*\]", r"^LTCG = (?:True|False)")
+KEPT_SETTINGS = (r'^MSVC_VERSION = "[^"]*"', r"^CL_FLAGS = \[[^\]]*\]", r"^GCC_FLAGS = \[[^\]]*\]", r"^LTCG = (?:True|False)")
 
 
 def tools_version() -> str:
@@ -2885,7 +2937,8 @@ def _run(cmd: list[str], root: Path, what: str, log, platform: str = "pc") -> No
 
 def create(root: Path, game: Path, *, compiler: str | None = None, log=print, info: dict | None = None,
            platform: str = "pc", what: str = "your copy of the game's program (.exe)",
-           cl_flags: list[str] | None = None, game_step: str = "", args: list[str] | None = None, plan=None) -> dict:
+           cl_flags: list[str] | None = None, game_step: str = "", args: list[str] | None = None, plan=None,
+           ida_analysis: Path | None = None) -> dict:
     """Make the project in `root` (which must not exist yet) and build it once. Returns facts about the game. Another
     console whose games are x86 programs in another format gives the program as a PE (`game`) and says what it is
     (`info`, as game_info's; `platform`, `what`), its compiler flags (`cl_flags`), how the README's reader gets the
@@ -2898,11 +2951,15 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
 
     info = info or game_info(game)
     version = info["id"]
+    requested_compiler = compiler
     compiler = (compiler or f"MSVC/{info['compiler']}").removeprefix("MSVC/")
     from . import X64_SUFFIX, WindowsPC
 
+    gcc = info.get("gcc") if platform == "pc" and not requested_compiler else None
+    compiler_id = f"GCC/{gcc}" if gcc else f"MSVC/{compiler}"
+    gcc_driver = mingw_compiler(gcc, info.get("gcc_runtime")) if gcc else None
     target = info.get("target", "x86")  # (another console's info may not say: its programs are 32-bit x86 ones)
-    if (theirs := "x64" if compiler.endswith(X64_SUFFIX) else "x86") != target:
+    if (theirs := "x64" if gcc or compiler.endswith(X64_SUFFIX) else "x86") != target:
         # (review of #138: the import's list offered MSVC/14.16-x64 for a 32-bit game, whose project then built x64
         # objects that can never match its code)
         raise ForkError(f"Visual C++ {compiler} makes {theirs} code, and this game is an {target} program: none of "
@@ -2912,28 +2969,42 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
     for why in info["cannot_match"]:
         log(f"what can't match: {why}")
     own = compiler in own_versions(args or ())  # (a compiler of the user's own: in a kit, not a pack)
-    if not info["cannot_match"]:
+    if gcc:
+        log(f"building with {compiler_id} ({gcc_driver}); compiler flags are initial estimates")
+    elif not info["cannot_match"]:
         # (a console that doesn't track "exact" (consoles/xbox: always its own compiler) gets the plain word; a
         # copy of the user's own that's another build of the game's version says so whole in compiler_why)
         log(f"it can match: decompdecomp builds with Visual C++ {compiler}" if info.get("exact", True) else
             f"much of it can match: {info['compiler_why']}" + ("" if own else f" Visual C++ {compiler}"))
-    pack = "msvc" if own else compiler_pack(compiler)
+    pack = None if gcc else "msvc" if own else compiler_pack(compiler)
     # (installed() is None too when a pack's headers aren't installed, or toolchains.toml changed it: install again)
-    if not own and (toolchains.installed(pack) is None or not (toolchains.path(pack) / compiler).is_dir()):
+    if pack and not own and (toolchains.installed(pack) is None or not (toolchains.path(pack) / compiler).is_dir()):
         raise ForkError(f"this game builds with Visual C++ {compiler}, which comes in {toolchains.get(pack).name}: "
                         "install it in Setup (Compilers & tools) if you accept its licence, then try again")
-    if not own and (problem := toolchains.runtime_error(pack)):  # (2017's runs through wine off Windows)
+    if pack and not own and (problem := toolchains.runtime_error(pack)):  # (2017's runs through wine off Windows)
         raise ForkError(f"this game builds with Visual C++ {compiler}, which needs what this computer lacks: {problem}")
-    args = args or tool_args()
-    ensure_ghidra(log)
+    args = ["--gcc", gcc_driver] if gcc_driver else args or tool_args()
+    if ida_analysis is None:
+        ensure_ghidra(log)
     pe = read_pe(game.read_bytes())
     modules, left_out = find_modules(game, pe)
+    if ida_analysis is not None and (not pe.x64 or modules):
+        raise ForkError("The IDA import requires a standalone x64 Windows PE")
+    if gcc and modules:
+        raise ForkError("MinGW-w64 GCC imports currently support a single Windows program without companion DLLs")
     if modules or left_out:
         log(f"the game's own DLLs beside {game.name}: {', '.join(m.rel for m in modules) or 'none'}")
     for line in left_out_lines(left_out):
         log(line)
-    log(f"analysing {game.name} with Ghidra (finds every function; a big game takes a few minutes)")
-    found = ghidra.functions(game)
+    if ida_analysis is not None:
+        analysis = json.loads(ida_analysis.read_text(encoding="utf-8"))
+        if analysis.get("sha1") != info["sha1"] or not analysis.get("functions"):
+            raise ForkError("The IDA analysis is empty or belongs to a different PE")
+        found = analysis["functions"]
+        log(f"analysing {game.name} from {len(found):,} IDA function entries")
+    else:
+        log(f"analysing {game.name} with Ghidra (finds every function; a big game takes a few minutes)")
+        found = ghidra.functions(game, require_conventions=False) if pe.x64 else ghidra.functions(game)
     if not found:
         why = (info["cannot_match"] or ["a program that is packed or protected in a way decompdecomp doesn't recognise "
                                         "shows none: decompdecomp never unpacks or gets around protection"])[0]
@@ -2942,7 +3013,8 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
     if debug is not None:
         log(f"{debug.source}: {debug.info.summary()}")
     groups = _program_units(pe, found, log, debug.info.units if debug is not None else None)
-    log(f"{sum(map(len, groups.values()))} functions; {info['compiler_why']}: Visual C++ {compiler}")
+    compiler_name = compiler_id if gcc else f"Visual C++ {compiler}"
+    log(f"{sum(map(len, groups.values()))} functions; {info['compiler_why']}: {compiler_name}")
     plan = plan(pe, [f for fns in groups.values() for f in fns]) if plan is not None else {}
     cl_flags = plan.get("cl_flags", cl_flags)
     pes, own = {"": pe}, {}
@@ -2994,6 +3066,11 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
             + ("debug information and " if found_debug is not None else "") + "exports")
 
     shutil.copytree(TEMPLATE, root)
+    if ida_analysis is not None:
+        local_analysis = root / ".decomp-wtf"
+        local_analysis.mkdir()
+        for name in ("ida-functions.json", "hexrays-drafts.json", "export_hexrays.py"):
+            shutil.copyfile(ida_analysis.parent / name, local_analysis / name)
     (root / "orig").mkdir()
     for source, dest in ((game, root / "orig" / f"{version}.exe"), *((m.path, root / "orig" / m.rel) for m in modules)):
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -3003,11 +3080,14 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
             shutil.copyfile(source, dest)
     (root / "include").mkdir()
     types = TYPES_H_X64 if pe.x64 else TYPES_H
+    if gcc:
+        types = types.replace("Visual C++", "MinGW-w64 GCC").replace("__int64", "long long")
     (root / "include" / "common.h").write_text(types, encoding="utf-8")
     cfg = root / "tools" / "configure.py"
-    cfg.write_text(configure_settings(cfg.read_text(encoding="utf-8"), compiler, pe, log=log, modules=modules,
-                                      ehsc=pack != "msvc" or info.get("modern_eh"), cl_flags=cl_flags),
-                   encoding="utf-8")
+    if not gcc:
+        cfg.write_text(configure_settings(cfg.read_text(encoding="utf-8"), compiler, pe, log=log, modules=modules,
+                                          ehsc=pack != "msvc" or info.get("modern_eh"), cl_flags=cl_flags),
+                       encoding="utf-8")
     conf = root / "config" / version
     conf.mkdir(parents=True)
     (conf / "functions.json").write_text(json.dumps({
@@ -3028,12 +3108,12 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
         write_debug(root, version, debugs[0])
     _write_compilers(compilers_file(root, version), own)  # (the DLLs built by another Visual C++; the rest: its own)
     _write_compilers(flags_file(root, version), {})  # (set_frame_flags below: once the thunks are functions)
-    if stubs := mark_exception_stubs(root, version):
+    if not gcc and (stubs := mark_exception_stubs(root, version)):
         log(f"{stubs} of them are exception-handling code Visual C++ makes from the function they belong to: set aside")
     if thunks := name_import_thunks(root, version):
         log(f"{thunks} of them are import thunks the linker adds for calls to DLLs' functions: named after the "
             "function each calls, and set aside")
-    if frames := set_frame_flags(root, version):
+    if not gcc and (frames := set_frame_flags(root, version)):
         log(f"{frames} of {len(groups)} source files keep an ebp frame in most of their functions: they build "
             f"with {FRAME_FLAG} (Visual C++ keeps the frame pointer)")
     sources = {addr: source for known in debugs for addr, source in known.units.items()}
@@ -3064,31 +3144,39 @@ def create(root: Path, game: Path, *, compiler: str | None = None, log=print, in
     rebuild = check_code(root, version, log=log)
 
     (root / ".decomp.wtf.json").write_text(json.dumps({
-        "created": "from scratch", "platform": platform, "version": version, "compiler": f"MSVC/{compiler}",
+        "created": "from scratch", "platform": platform, "version": version, "compiler": compiler_id,
         "analysis": WindowsPC.ANALYSIS,  # (all of it: nothing to repair, stubs set aside, pieces joined, thunks named...)
         "tools": tools_version(),
+        **({"analysis_provider": "ida"} if ida_analysis is not None else {}),
         "game": {"what": what, "path": f"orig/{version}.exe", "sha1": info["sha1"]},
         "setup": [["python", "tools/configure.py", version, *args], ["ninja", "prepare"]],
         "rebuild": rebuild, **plan.get("manifest", {}),
     }, indent=2), encoding="utf-8")
     (root / ".gitignore").write_text("# made from your copy of the game, or by the build\norig/\nbuild/\nbuild.ninja\n"
                                      ".ninja_*\nobjdiff.json\n__pycache__/\n.decomp-wtf/\n", encoding="utf-8")
+    if gcc:
+        build_instructions = f"Run `python tools/configure.py {version} --gcc <path-to-g++>`, then `ninja`."
+        compiler_instructions = f"Compiler: {compiler_id}. Adjust GCC_FLAGS in tools/configure.py to match the original."
+    else:
+        build_instructions = (f"Run `python tools/configure.py {version} --msvc <Visual C++ folder> [--wibo <wibo>]`, "
+                              "then `ninja`. On Linux or macOS, Visual C++ 2017 requires Wine.")
+        compiler_instructions = (f"Compiler: Visual C++ {compiler}. Adjust MSVC_VERSION and CL_FLAGS in "
+                                 "tools/configure.py or set per-file versions in file_compilers.json.")
+    analysis_source = "found by IDA and refined using PE unwind data" if ida_analysis is not None else (
+        FOUND_BY_X64 if pe.x64 else "found by Ghidra")
     (root / "README.md").write_text(f"""# {info['title']} decompilation
 
-Started from scratch with [decompdecomp](https://github.com/n-delic/decompdecomp): the game's functions, {FOUND_BY_X64 if pe.x64 else 'found by Ghidra'}, are cut out of your
+Started from scratch with [decompdecomp](https://github.com/n-delic/decompdecomp): the game's functions, {analysis_source}, are cut out of your
 copy of its program and compared with what `src/` compiles to, function by function, with objdiff.
 
 1. {game_step or f"Put your own copy of the game's program here as `orig/{version}.exe`"} (never commit it).
-2. `python tools/configure.py {version} --msvc <Visual C++ folder> [--wibo <wibo>]`, then `ninja`. A file built with
-   Visual C++ 2017 on Linux or macOS runs it through wine: set `DECOMPNET_WINE` (or have wine on the PATH) and
-   `DECOMPNET_WINE_PREFIX` (a wine prefix of its own) first.
+2. {build_instructions}
 3. Decompiled code goes in `src/`; `objdiff.json` shows each function's progress in [objdiff](https://github.com/encounter/objdiff).
 4. `ninja rebuild` puts the whole program back together in `build/{version}/{version}.exe`, each function from its C
    where that compiles to the game's code (else from your copy's), and says whether it's your copy, byte for byte.
 
-Compiler: Visual C++ {compiler} (change `MSVC_VERSION` and `CL_FLAGS` in tools/configure.py if the game was built
-with another version or other flags; `config/{version}/file_compilers.json` names the files built with another
-version). `config/{version}/functions.json` holds what the analysis found: every function's address, size, symbol
+{compiler_instructions}
+`config/{version}/functions.json` holds what the analysis found: every function's address, size, symbol
 and relocations, by source file.
 """ + (f"""
 The game's own DLLs are programs of this project too, each with its source files in `src/auto/<its name>/`:
@@ -3100,7 +3188,7 @@ one) is moved by its base relocations at build time, as Windows moves it.
     if shutil.which("git"):
         for cmd in (["git", "init", "-q", "-b", "main"], ["git", "add", "-A"],
                     ["git", "-c", "user.name=decompdecomp", "-c", "user.email=noreply@decompdecomp.invalid", "commit", "-q", "-m",
-                     f"Start the {info['title']} decompilation (decompdecomp, Ghidra)"]):
+                     f"Start the {info['title']} decompilation (decompdecomp, {'IDA' if ida_analysis else 'Ghidra'})"]):
             subprocess.run(cmd, cwd=root, capture_output=True, creationflags=NO_WINDOW)
-    return {"platform": platform, "id": version, "title": info["title"], "compiler": f"MSVC/{compiler}",
+    return {"platform": platform, "id": version, "title": info["title"], "compiler": compiler_id,
             "sources": len(groups), "sha1": info["sha1"]}
